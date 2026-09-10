@@ -9,8 +9,6 @@ on:
 permissions:
   contents: read
   packages: write
-  attestations: write
-  id-token: write
 
 concurrency:
   group: container-${{ github.ref }}
@@ -62,8 +60,3 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: mode=max
           sbom: true
-      - uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
-        with:
-          subject-name: ghcr.io/jsserve-org/cliproxyapi-rust
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
