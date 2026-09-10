@@ -11,7 +11,7 @@ Implemented:
 
 - `GET /v1/models`
 - `POST /v1/responses` and `/v1/responses/compact`
-- Streaming `POST /v1/messages` translation for Claude Code text, images,
+- Streaming and non-streaming `POST /v1/messages` translation for Claude Code text, images,
   tool calls/results, and basic reasoning settings
 - `/backend-api/codex/{responses,responses/compact,alpha/search}`
 - Round-robin Codex account selection and bounded retry/failover
@@ -21,17 +21,19 @@ Implemented:
   enable/disable, reload, usage queue, and allowlisted `api-call`
 - Existing CLIProxyAPI Codex auth-file shape and plaintext or bcrypt management keys
 
-Not yet a one-to-one replacement:
+Not yet a one-to-one replacement. The pinned upstream revision, completion
+criteria, subsystem status, and porting order are tracked in
+[`docs/PARITY.md`](docs/PARITY.md):
 
-- Non-streaming Claude messages, token counting, and the full set of Anthropic
-  beta/content-block extensions
+- Claude token counting and the full set of Anthropic beta/content-block
+  extensions
 - Interactive OAuth login/device authorization (existing refresh tokens are supported)
 - Chat Completions, Gemini, Anthropic, realtime, image/video, plugins, and Home
 - Full usage accounting and the remaining CLIProxyAPI management routes
 
-Unknown management paths return `501 Not Implemented`. Do not replace a full
-CLIProxyAPI deployment until the endpoints used by your clients are covered by
-contract tests.
+Unknown management paths return `501 Not Implemented`. Public unknown paths
+and unsupported methods always return an empty `404`. Do not replace a full
+CLIProxyAPI deployment until the parity contract passes.
 
 ## Two-port security model
 

@@ -4,7 +4,7 @@ use async_stream::stream;
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{HeaderValue, Method, StatusCode},
+    http::{HeaderValue, Method},
     response::{IntoResponse, Response},
 };
 use bytes::{Bytes, BytesMut};
@@ -25,9 +25,7 @@ pub async fn messages(
         .map_err(|_| AppError::bad_request("request body exceeds limit"))?;
     let payload: Value =
         serde_json::from_slice(&input).map_err(|_| AppError::bad_request("invalid JSON body"))?;
-    if payload.get("stream").and_then(Value::as_bool) == Some(false) {
-        return Ok(StatusCode::NOT_FOUND.into_response());
-    }
+    let stream = payload.get("stream").and_then(Value::as_bool) != Some(false);
     let model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -52,6 +50,9 @@ pub async fn messages(
             format!("Codex upstream returned HTTP {status}"),
         ));
     }
+    if !stream {
+        return translate_non_stream(upstream, model, state.config.max_body_bytes).await;
+    }
     let body = translate_stream(upstream, model);
     let mut response = Response::new(body);
     response.headers_mut().insert(
@@ -62,6 +63,147 @@ pub async fn messages(
         .headers_mut()
         .insert("cache-control", HeaderValue::from_static("no-cache"));
     Ok(response)
+}
+
+async fn translate_non_stream(
+    upstream: reqwest::Response,
+    requested_model: String,
+    max_bytes: usize,
+) -> Result<Response, AppError> {
+    let mut input = upstream.bytes_stream();
+    let mut buffer = BytesMut::new();
+    let mut received = 0_usize;
+    let mut completed = None;
+    let mut upstream_error = None;
+
+    while let Some(chunk) = input.next().await {
+        let chunk = chunk.map_err(|_| AppError::bad_gateway("upstream stream failed"))?;
+        received = received
+            .checked_add(chunk.len())
+            .ok_or_else(|| AppError::bad_gateway("upstream response exceeds limit"))?;
+        if received > max_bytes {
+            return Err(AppError::bad_gateway("upstream response exceeds limit"));
+        }
+        buffer.extend_from_slice(&chunk);
+        consume_sse_lines(&mut buffer, |event| {
+            match event.get("type").and_then(Value::as_str) {
+                Some("response.completed") => completed = event.get("response").cloned(),
+                Some("error") | Some("response.failed") => {
+                    upstream_error = Some(
+                        event
+                            .pointer("/error/message")
+                            .or_else(|| event.pointer("/response/error/message"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("upstream response failed")
+                            .to_owned(),
+                    )
+                }
+                _ => {}
+            }
+        })?;
+    }
+    if !buffer.is_empty() {
+        buffer.extend_from_slice(b"\n");
+        consume_sse_lines(&mut buffer, |event| {
+            if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                completed = event.get("response").cloned();
+            }
+        })?;
+    }
+    if let Some(message) = upstream_error {
+        return Err(AppError::bad_gateway(message));
+    }
+    let completed = completed
+        .ok_or_else(|| AppError::bad_gateway("upstream response ended before completion"))?;
+    Ok(axum::Json(translate_completed_response(&completed, &requested_model)?).into_response())
+}
+
+fn consume_sse_lines(
+    buffer: &mut BytesMut,
+    mut consume: impl FnMut(Value),
+) -> Result<(), AppError> {
+    if buffer.len() > MAX_SSE_LINE && !buffer.contains(&b'\n') {
+        return Err(AppError::bad_gateway("upstream SSE event exceeds limit"));
+    }
+    while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+        let line = buffer.split_to(position + 1);
+        let line = line.strip_suffix(b"\n").unwrap_or(&line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(data) = line.strip_prefix(b"data:") else {
+            continue;
+        };
+        let data = data.strip_prefix(b" ").unwrap_or(data);
+        if data == b"[DONE]" {
+            continue;
+        }
+        let event = serde_json::from_slice(data)
+            .map_err(|_| AppError::bad_gateway("invalid upstream SSE event"))?;
+        consume(event);
+    }
+    Ok(())
+}
+
+fn translate_completed_response(
+    response: &Value,
+    requested_model: &str,
+) -> Result<Value, AppError> {
+    let mut content = Vec::new();
+    let mut used_tool = false;
+    for item in response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                for part in item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                        content.push(json!({
+                            "type": "text",
+                            "text": part.get("text").and_then(Value::as_str).unwrap_or_default()
+                        }));
+                    }
+                }
+            }
+            Some("function_call") => {
+                used_tool = true;
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                let input = serde_json::from_str::<Value>(arguments).map_err(|_| {
+                    AppError::bad_gateway("upstream returned invalid tool arguments")
+                })?;
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": item.get("call_id").and_then(Value::as_str).unwrap_or_default(),
+                    "name": item.get("name").and_then(Value::as_str).unwrap_or_default(),
+                    "input": input
+                }));
+            }
+            _ => {}
+        }
+    }
+    let usage = response.get("usage").unwrap_or(&Value::Null);
+    Ok(json!({
+        "id": response.get("id").and_then(Value::as_str).unwrap_or("msg_rust"),
+        "type": "message",
+        "role": "assistant",
+        "model": requested_model,
+        "content": content,
+        "stop_reason": if used_tool { "tool_use" } else { "end_turn" },
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+            "output_tokens": usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
+        }
+    }))
 }
 
 fn translate_request(input: Value) -> Result<Value, AppError> {
@@ -305,7 +447,7 @@ fn sse(name: &str, payload: Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::translate_request;
+    use super::{translate_completed_response, translate_request};
     use serde_json::json;
     #[test]
     fn translates_tool_round_trip_shape() {
@@ -319,5 +461,24 @@ mod tests {
             output.pointer("/input/1/type").and_then(|v| v.as_str()),
             Some("function_call_output")
         );
+    }
+
+    #[test]
+    fn translates_completed_response_with_text_and_tool_use() {
+        let response = json!({
+            "id": "resp_123",
+            "output": [
+                {"type":"message","content":[{"type":"output_text","text":"hello"}]},
+                {"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"pwd\"}"}
+            ],
+            "usage": {"input_tokens": 12, "output_tokens": 7}
+        });
+        let translated = translate_completed_response(&response, "gpt-test").unwrap();
+        assert_eq!(translated["id"], "resp_123");
+        assert_eq!(translated["model"], "gpt-test");
+        assert_eq!(translated["stop_reason"], "tool_use");
+        assert_eq!(translated["content"][0]["text"], "hello");
+        assert_eq!(translated["content"][1]["input"]["cmd"], "pwd");
+        assert_eq!(translated["usage"]["output_tokens"], 7);
     }
 }
