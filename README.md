@@ -54,6 +54,13 @@ cargo build --release
 
 Point CPAMP at `http://127.0.0.1:8318`; point API clients at port `8317`.
 
+Private multi-architecture images are published for `linux/amd64` and
+`linux/arm64` by GitHub Actions:
+
+```sh
+docker pull ghcr.io/jsserve-org/cliproxyapi-rust:latest
+```
+
 ## Resource choices
 
 - One Tokio process and one shared rustls connection pool
