@@ -1,0 +1,32 @@
+# Internet-facing API-only listener. Put TLS and rate limiting in front of this.
+host: 0.0.0.0
+port: 8317
+
+# API + management listener. Keep this on loopback or a private VPN interface.
+admin-host: 127.0.0.1
+admin-port: 8318
+
+auth-dir: ~/.cli-proxy-api
+api-keys:
+  - replace-with-a-long-random-public-api-key
+
+remote-management:
+  secret-key: replace-with-a-different-long-random-management-key
+
+max-concurrency: 64
+max-body-bytes: 16777216
+upstream-timeout-seconds: 600
+request-retry: 2
+upstream-url: https://chatgpt.com/backend-api/codex
+usage-statistics-enabled: false
+redis-usage-queue-retention-seconds: 60
+proxy-url: ""
+
+# CPAMP's management api-call endpoint is an SSRF capability. Only these HTTPS
+# destinations are accepted. Add an exact provider hostname if CPAMP needs it.
+management-allowed-hosts:
+  - chatgpt.com
+  - api.openai.com
+  - api.anthropic.com
+  - api.x.ai
+
