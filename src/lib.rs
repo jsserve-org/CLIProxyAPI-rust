@@ -69,6 +69,8 @@ fn api_routes(state: &AppState) -> Router<AppState> {
         .route("/", get(proxy::root))
         .route("/healthz", get(proxy::health).head(proxy::health))
         .merge(protected)
+        .fallback(proxy::not_found)
+        .method_not_allowed_fallback(proxy::not_found)
         .layer(DefaultBodyLimit::max(state.config.max_body_bytes))
         .layer(ConcurrencyLimitLayer::new(state.config.max_concurrency))
 }
@@ -134,6 +136,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn public_unknown_paths_and_methods_are_plain_not_found() {
+        for request in [
+            Request::get("/").body(Body::empty()).unwrap(),
+            Request::get("/definitely-not-a-route")
+                .body(Body::empty())
+                .unwrap(),
+            Request::delete("/v1/models").body(Body::empty()).unwrap(),
+        ] {
+            let response = api_router(state().await).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert!(body.is_empty());
+        }
     }
 
     #[tokio::test]

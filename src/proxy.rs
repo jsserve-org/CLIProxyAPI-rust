@@ -15,9 +15,11 @@ pub async fn health() -> impl IntoResponse {
 }
 
 pub async fn root() -> impl IntoResponse {
-    axum::Json(
-        json!({"message": "CLI Proxy API Server (Rust)", "endpoints": ["POST /v1/responses", "POST /v1/messages", "GET /v1/models"]}),
-    )
+    StatusCode::NOT_FOUND
+}
+
+pub async fn not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 pub async fn models(State(state): State<AppState>) -> impl IntoResponse {
@@ -55,7 +57,7 @@ pub async fn backend(
     request: Request,
 ) -> Result<Response, AppError> {
     if path != "responses" && path != "responses/compact" && path != "alpha/search" {
-        return Err(AppError::not_found("unsupported Codex endpoint"));
+        return Ok(StatusCode::NOT_FOUND.into_response());
     }
     forward(state, request, &path).await
 }

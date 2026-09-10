@@ -5,7 +5,7 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{HeaderValue, Method, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
@@ -26,10 +26,7 @@ pub async fn messages(
     let payload: Value =
         serde_json::from_slice(&input).map_err(|_| AppError::bad_request("invalid JSON body"))?;
     if payload.get("stream").and_then(Value::as_bool) == Some(false) {
-        return Err(AppError::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "non-streaming Claude messages are not implemented",
-        ));
+        return Ok(StatusCode::NOT_FOUND.into_response());
     }
     let model = payload
         .get("model")
