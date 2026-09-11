@@ -40,7 +40,7 @@ row below is complete and the full parity suite passes.
 | OpenAI models | Unified and provider-aware model listing | Partial; static Codex list only |
 | Responses | HTTP streaming/non-streaming, compact, WebSocket, Codex direct aliases, Alpha Search | Partial; HTTP forwarding and compact/Alpha aliases |
 | Chat/completions | OpenAI chat completions and legacy completions | Missing |
-| Anthropic Messages | Streaming, non-streaming, token counting, beta blocks, thinking/signatures, tool behavior | Partial; basic streaming and non-streaming translation |
+| Anthropic Messages | Streaming, non-streaming, token counting, beta blocks, thinking/signatures, tool behavior | Partial; basic streaming/non-streaming translation and local Codex token counting |
 | Gemini | Models, generate/stream content, interactions and compatible actions | Missing |
 | Realtime | WebSocket, WebRTC/SIP calls, sideband control, sessions, transcription and translation | Missing |
 | Images and video | OpenAI-compatible images plus xAI/OpenAI video create/edit/extend/retrieve/content | Missing |

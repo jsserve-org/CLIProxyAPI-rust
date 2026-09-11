@@ -60,6 +60,7 @@ fn api_routes(state: &AppState) -> Router<AppState> {
         .route("/v1/responses", post(proxy::responses))
         .route("/v1/responses/compact", post(proxy::responses_compact))
         .route("/v1/messages", post(claude::messages))
+        .route("/v1/messages/count_tokens", post(claude::count_tokens))
         .route("/backend-api/codex/{*path}", any(proxy::backend))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

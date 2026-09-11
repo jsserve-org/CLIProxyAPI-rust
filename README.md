@@ -13,6 +13,8 @@ Implemented:
 - `POST /v1/responses` and `/v1/responses/compact`
 - Streaming and non-streaming `POST /v1/messages` translation for Claude Code text, images,
   tool calls/results, and basic reasoning settings
+- Local `POST /v1/messages/count_tokens` using the same O200k input-segment
+  policy as the pinned Go Codex executor
 - `/backend-api/codex/{responses,responses/compact,alpha/search}`
 - Round-robin Codex account selection and bounded retry/failover
 - On-demand refresh of existing Codex OAuth refresh tokens after an upstream 401
@@ -25,8 +27,7 @@ Not yet a one-to-one replacement. The pinned upstream revision, completion
 criteria, subsystem status, and porting order are tracked in
 [`docs/PARITY.md`](docs/PARITY.md):
 
-- Claude token counting and the full set of Anthropic beta/content-block
-  extensions
+- The full set of Anthropic beta/content-block extensions
 - Interactive OAuth login/device authorization (existing refresh tokens are supported)
 - Chat Completions, Gemini, Anthropic, realtime, image/video, plugins, and Home
 - Full usage accounting and the remaining CLIProxyAPI management routes

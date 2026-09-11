@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::OnceLock};
 
 use async_stream::stream;
 use axum::{
@@ -10,10 +10,207 @@ use axum::{
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
+use tiktoken_rs::CoreBPE;
 
 use crate::{AppState, error::AppError, proxy};
 
 const MAX_SSE_LINE: usize = 4 * 1024 * 1024;
+static CLAUDE_TOKENIZER: OnceLock<Result<CoreBPE, String>> = OnceLock::new();
+
+pub async fn count_tokens(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Response, AppError> {
+    let bytes = axum::body::to_bytes(request.into_body(), state.config.max_body_bytes)
+        .await
+        .map_err(|_| AppError::bad_request("request body exceeds limit"))?;
+    let payload: Value =
+        serde_json::from_slice(&bytes).map_err(|_| AppError::bad_request("invalid JSON body"))?;
+    if !payload.is_object() {
+        return Err(AppError::bad_request("JSON body must be an object"));
+    }
+    let count = tokio::task::spawn_blocking(move || count_claude_input_tokens(&payload))
+        .await
+        .map_err(|_| AppError::bad_gateway("token counting task failed"))??;
+    Ok(axum::Json(json!({"input_tokens": count})).into_response())
+}
+
+fn count_claude_input_tokens(payload: &Value) -> Result<usize, AppError> {
+    let tokenizer = CLAUDE_TOKENIZER.get_or_init(|| {
+        tiktoken_rs::o200k_base().map_err(|error| format!("initialize tokenizer: {error}"))
+    });
+    let tokenizer = tokenizer
+        .as_ref()
+        .map_err(|error| AppError::bad_gateway(error.clone()))?;
+    let segments = collect_claude_input_token_segments(payload);
+    if segments.is_empty() {
+        return Ok(0);
+    }
+    Ok(tokenizer.encode_ordinary(&segments.join("\n")).len())
+}
+
+fn collect_claude_input_token_segments(payload: &Value) -> Vec<String> {
+    let mut segments = Vec::with_capacity(32);
+    collect_system_segments(payload.get("system"), &mut segments);
+    collect_message_segments(payload.get("messages"), &mut segments);
+    collect_tool_segments(payload.get("tools"), &mut segments);
+    collect_tool_choice_segments(payload.get("tool_choice"), &mut segments);
+    segments
+}
+
+fn collect_system_segments(value: Option<&Value>, segments: &mut Vec<String>) {
+    match value {
+        Some(Value::String(text)) => push_string(segments, text),
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                match part {
+                    Value::String(text) => push_string(segments, text),
+                    Value::Object(object)
+                        if object.get("type").and_then(Value::as_str) == Some("text") =>
+                    {
+                        push_value_string(segments, object.get("text"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_message_segments(value: Option<&Value>, segments: &mut Vec<String>) {
+    let Some(messages) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for message in messages {
+        push_value_string(segments, message.get("role"));
+        collect_content_segments(message.get("content"), segments);
+    }
+}
+
+fn collect_content_segments(value: Option<&Value>, segments: &mut Vec<String>) {
+    let Some(value) = value else { return };
+    match value {
+        Value::String(text) => push_string(segments, text),
+        Value::Array(parts) => {
+            for part in parts {
+                collect_content_segments(Some(part), segments);
+            }
+        }
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("text") => push_value_string(segments, object.get("text")),
+            Some("thinking") => push_value_string(segments, object.get("thinking")),
+            Some("document") => collect_document_segments(object, segments),
+            Some("tool_use" | "server_tool_use" | "mcp_tool_use") => {
+                push_value_string(segments, object.get("id"));
+                push_value_string(segments, object.get("name"));
+                push_json(segments, object.get("input"));
+            }
+            Some(
+                "tool_result"
+                | "mcp_tool_result"
+                | "web_search_tool_result"
+                | "web_fetch_tool_result"
+                | "code_execution_tool_result"
+                | "bash_code_execution_tool_result"
+                | "text_editor_code_execution_tool_result",
+            ) => {
+                push_value_string(segments, object.get("tool_use_id"));
+                push_value_string(segments, object.get("tool_call_id"));
+                collect_content_segments(object.get("content"), segments);
+            }
+            Some("web_search_result" | "search_result") => {
+                push_value_string(segments, object.get("source"));
+                for key in ["title", "url", "page_age"] {
+                    push_value_string(segments, object.get(key));
+                }
+                collect_content_segments(object.get("content"), segments);
+            }
+            Some("web_fetch_result") => {
+                push_value_string(segments, object.get("url"));
+                push_value_string(segments, object.get("retrieved_at"));
+                collect_content_segments(object.get("content"), segments);
+            }
+            Some(
+                "code_execution_result"
+                | "bash_code_execution_result"
+                | "text_editor_code_execution_result",
+            ) => {
+                for key in ["stdout", "stderr", "return_code"] {
+                    push_value_string(segments, object.get(key));
+                }
+                collect_content_segments(object.get("content"), segments);
+                collect_content_segments(object.get("output"), segments);
+            }
+            Some("tool_reference") => push_value_string(segments, object.get("tool_name")),
+            Some("image" | "input_audio" | "audio" | "video" | "redacted_thinking") => {}
+            None => push_json(segments, Some(value)),
+            _ => push_value_string(segments, object.get("text")),
+        },
+        _ => {}
+    }
+}
+
+fn collect_document_segments(object: &Map<String, Value>, segments: &mut Vec<String>) {
+    let Some(source) = object.get("source").and_then(Value::as_object) else {
+        return;
+    };
+    if source.get("type").and_then(Value::as_str) != Some("text") {
+        return;
+    }
+    push_value_string(segments, object.get("title"));
+    push_value_string(segments, object.get("context"));
+    push_value_string(segments, source.get("data"));
+    push_value_string(segments, source.get("content"));
+}
+
+fn collect_tool_segments(value: Option<&Value>, segments: &mut Vec<String>) {
+    let Some(tools) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for tool in tools {
+        for key in ["type", "name", "description"] {
+            push_value_string(segments, tool.get(key));
+        }
+        push_json(segments, tool.get("input_schema"));
+    }
+}
+
+fn collect_tool_choice_segments(value: Option<&Value>, segments: &mut Vec<String>) {
+    match value {
+        Some(Value::String(text)) => push_string(segments, text),
+        Some(value) => {
+            push_value_string(segments, value.get("type"));
+            push_value_string(segments, value.get("name"));
+        }
+        None => {}
+    }
+}
+
+fn push_value_string(segments: &mut Vec<String>, value: Option<&Value>) {
+    if let Some(text) = value.and_then(Value::as_str) {
+        push_string(segments, text);
+    }
+}
+
+fn push_string(segments: &mut Vec<String>, value: &str) {
+    let trimmed = value.trim();
+    if !trimmed.is_empty() {
+        segments.push(trimmed.to_owned());
+    }
+}
+
+fn push_json(segments: &mut Vec<String>, value: Option<&Value>) {
+    let Some(value) = value else { return };
+    match value {
+        Value::String(text) => push_string(segments, text),
+        value => {
+            if let Ok(encoded) = serde_json::to_string(value) {
+                push_string(segments, &encoded);
+            }
+        }
+    }
+}
 
 pub async fn messages(
     State(state): State<AppState>,
@@ -447,7 +644,10 @@ fn sse(name: &str, payload: Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{translate_completed_response, translate_request};
+    use super::{
+        collect_claude_input_token_segments, count_claude_input_tokens,
+        translate_completed_response, translate_request,
+    };
     use serde_json::json;
     #[test]
     fn translates_tool_round_trip_shape() {
@@ -480,5 +680,88 @@ mod tests {
         assert_eq!(translated["content"][0]["text"], "hello");
         assert_eq!(translated["content"][1]["input"]["cmd"], "pwd");
         assert_eq!(translated["usage"]["output_tokens"], 7);
+    }
+
+    #[test]
+    fn token_segments_match_pinned_go_fixture() {
+        let payload = json!({
+            "model":"claude-test",
+            "system":[
+                {"type":"text","text":"Follow repository rules.","cache_control":{"type":"ephemeral"}},
+                {"type":"image","source":{"type":"base64","data":"ignored-system-image"}}
+            ],
+            "messages":[
+                {"role":"user","content":[
+                    {"type":"text","text":"Review the implementation."},
+                    {"type":"document","source":{"type":"text","data":"Reference document text."}},
+                    {"type":"image","source":{"type":"base64","data":"ignored-image"}}
+                ]},
+                {"role":"assistant","content":[
+                    {"type":"thinking","thinking":"Inspect the relevant files.","signature":"ignored-signature"},
+                    {"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"main.go"}}
+                ]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[
+                    {"type":"text","text":"package main"},
+                    {"type":"image","source":{"type":"base64","data":"ignored-tool-image"}}
+                ]}]}
+            ],
+            "tools":[{"name":"read_file","description":"Reads a repository file.","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}],
+            "tool_choice":{"type":"tool","name":"read_file"},
+            "metadata":{"user_id":"ignored-metadata"},
+            "max_tokens":4096,
+            "stream":true
+        });
+        assert_eq!(
+            collect_claude_input_token_segments(&payload),
+            vec![
+                "Follow repository rules.",
+                "user",
+                "Review the implementation.",
+                "Reference document text.",
+                "assistant",
+                "Inspect the relevant files.",
+                "toolu_1",
+                "read_file",
+                "{\"path\":\"main.go\"}",
+                "user",
+                "toolu_1",
+                "package main",
+                "read_file",
+                "Reads a repository file.",
+                "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}",
+                "tool",
+                "read_file"
+            ]
+        );
+    }
+
+    #[test]
+    fn token_count_excludes_multimedia_and_control_fields() {
+        let base = json!({
+            "system":"System text.",
+            "messages":[{"role":"user","content":[{"type":"text","text":"User text."}]}],
+            "tools":[{"name":"lookup","description":"Looks up data.","input_schema":{"type":"object"}}]
+        });
+        let extended = json!({
+            "model":"claude-test",
+            "system":"System text.",
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"User text."},
+                {"type":"image","source":{"type":"base64","data":"very-large-image-data"}},
+                {"type":"input_audio","source":{"type":"base64","data":"very-large-audio-data"}},
+                {"type":"video","source":{"type":"url","url":"https://example.com/video.mp4"}},
+                {"type":"document","source":{"type":"base64","data":"very-large-pdf-data"}}
+            ]}],
+            "tools":[{"name":"lookup","description":"Looks up data.","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],
+            "metadata":{"large_wrapper":"ignored"},
+            "max_tokens":8192,
+            "temperature":0.8,
+            "thinking":{"type":"enabled","budget_tokens":4096},
+            "stream":true
+        });
+        assert_eq!(
+            count_claude_input_tokens(&base).unwrap(),
+            count_claude_input_tokens(&extended).unwrap()
+        );
     }
 }
