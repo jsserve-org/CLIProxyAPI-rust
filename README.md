@@ -1,3 +1,5 @@
+# Why this port? 
+Mainly for fun, since I have some usage left on my GPT subs. I decided to rewrite CLIProxyAPI to rust. However, I did realize that the Go version of CLIProxyAPI uses a lot of CPU and memory on my tiny VM, so this port also fixes that too, plus a few extra features that I want!
 # CLIProxyAPI Rust core
 
 This repository is a resource-conscious Rust port of the Codex hot path from
