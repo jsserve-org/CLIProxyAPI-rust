@@ -228,7 +228,10 @@ pub async fn messages(
         .and_then(Value::as_str)
         .unwrap_or("gpt-5.6-sol")
         .to_owned();
-    let translated = translate_request(payload)?;
+    let translated = translate_request(&payload)?;
+    let input_tokens = tokio::task::spawn_blocking(move || count_claude_input_tokens(&payload))
+        .await
+        .map_err(|_| AppError::bad_gateway("token counting task failed"))??;
     let upstream = proxy::execute_codex(
         &state,
         &Method::POST,
@@ -248,9 +251,10 @@ pub async fn messages(
         ));
     }
     if !stream {
-        return translate_non_stream(upstream, model, state.config.max_body_bytes).await;
+        return translate_non_stream(upstream, model, input_tokens, state.config.max_body_bytes)
+            .await;
     }
-    let body = translate_stream(upstream, model);
+    let body = translate_stream(upstream, model, input_tokens);
     let mut response = Response::new(body);
     response.headers_mut().insert(
         "content-type",
@@ -265,6 +269,7 @@ pub async fn messages(
 async fn translate_non_stream(
     upstream: reqwest::Response,
     requested_model: String,
+    input_tokens: usize,
     max_bytes: usize,
 ) -> Result<Response, AppError> {
     let mut input = upstream.bytes_stream();
@@ -312,7 +317,12 @@ async fn translate_non_stream(
     }
     let completed = completed
         .ok_or_else(|| AppError::bad_gateway("upstream response ended before completion"))?;
-    Ok(axum::Json(translate_completed_response(&completed, &requested_model)?).into_response())
+    Ok(axum::Json(translate_completed_response(
+        &completed,
+        &requested_model,
+        input_tokens,
+    )?)
+    .into_response())
 }
 
 fn consume_sse_lines(
@@ -343,6 +353,7 @@ fn consume_sse_lines(
 fn translate_completed_response(
     response: &Value,
     requested_model: &str,
+    input_tokens: usize,
 ) -> Result<Value, AppError> {
     let mut content = Vec::new();
     let mut used_tool = false;
@@ -397,13 +408,13 @@ fn translate_completed_response(
         "stop_reason": if used_tool { "tool_use" } else { "end_turn" },
         "stop_sequence": null,
         "usage": {
-            "input_tokens": usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+            "input_tokens": input_tokens,
             "output_tokens": usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0)
         }
     }))
 }
 
-fn translate_request(input: Value) -> Result<Value, AppError> {
+fn translate_request(input: &Value) -> Result<Value, AppError> {
     let object = input
         .as_object()
         .ok_or_else(|| AppError::bad_request("JSON body must be an object"))?;
@@ -551,11 +562,15 @@ fn translate_tool(tool: &Value) -> Option<Value> {
     )
 }
 
-fn translate_stream(upstream: reqwest::Response, requested_model: String) -> Body {
+fn translate_stream(
+    upstream: reqwest::Response,
+    requested_model: String,
+    input_tokens: usize,
+) -> Body {
     let mut input = upstream.bytes_stream();
     let output = stream! {
         let mut buffer = BytesMut::new();
-        let mut state = StreamState::new(requested_model);
+        let mut state = StreamState::new(requested_model, input_tokens);
         while let Some(chunk) = input.next().await {
             let chunk = match chunk { Ok(value) => value, Err(error) => { yield Err(std::io::Error::other(error)); break; } };
             buffer.extend_from_slice(&chunk);
@@ -581,16 +596,18 @@ fn translate_stream(upstream: reqwest::Response, requested_model: String) -> Bod
 struct StreamState {
     model: String,
     id: String,
+    input_tokens: usize,
     started: HashSet<usize>,
     stopped: HashSet<usize>,
     tool_blocks: HashSet<usize>,
 }
 
 impl StreamState {
-    fn new(model: String) -> Self {
+    fn new(model: String, input_tokens: usize) -> Self {
         Self {
             model,
             id: String::new(),
+            input_tokens,
             started: HashSet::new(),
             stopped: HashSet::new(),
             tool_blocks: HashSet::new(),
@@ -609,7 +626,7 @@ impl StreamState {
         match kind {
             "response.created" | "response.in_progress" if self.id.is_empty() => {
                 self.id = event.pointer("/response/id").and_then(Value::as_str).unwrap_or("msg_rust").to_owned();
-                out.push(sse("message_start", json!({"type":"message_start","message":{"id":self.id,"type":"message","role":"assistant","model":self.model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}})));
+                out.push(sse("message_start", json!({"type":"message_start","message":{"id":self.id,"type":"message","role":"assistant","model":self.model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":self.input_tokens,"output_tokens":0}}})));
             }
             "response.output_item.added" => {
                 if event.pointer("/item/type").and_then(Value::as_str) == Some("function_call") && self.started.insert(index) {
@@ -652,7 +669,7 @@ mod tests {
     #[test]
     fn translates_tool_round_trip_shape() {
         let request = json!({"model":"gpt-5.6-sol","stream":true,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"shell","input":{"cmd":"pwd"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"ok"}]}],"tools":[{"name":"shell","description":"run","input_schema":{"type":"object"}}]});
-        let output = translate_request(request).unwrap();
+        let output = translate_request(&request).unwrap();
         assert_eq!(
             output.pointer("/input/0/type").and_then(|v| v.as_str()),
             Some("function_call")
@@ -673,12 +690,13 @@ mod tests {
             ],
             "usage": {"input_tokens": 12, "output_tokens": 7}
         });
-        let translated = translate_completed_response(&response, "gpt-test").unwrap();
+        let translated = translate_completed_response(&response, "gpt-test", 23).unwrap();
         assert_eq!(translated["id"], "resp_123");
         assert_eq!(translated["model"], "gpt-test");
         assert_eq!(translated["stop_reason"], "tool_use");
         assert_eq!(translated["content"][0]["text"], "hello");
         assert_eq!(translated["content"][1]["input"]["cmd"], "pwd");
+        assert_eq!(translated["usage"]["input_tokens"], 23);
         assert_eq!(translated["usage"]["output_tokens"], 7);
     }
 
