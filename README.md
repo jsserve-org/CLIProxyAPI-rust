@@ -84,6 +84,10 @@ choice for an internet-facing service because it retains memory safety while
 remaining compact. Go is simpler but its garbage collector and per-connection
 runtime overhead are exactly what this port is intended to reduce.
 
+The measured baseline, methodology, limitations, and suggested
+restricted-server settings are recorded in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
 ## Internet deployment checklist
 
 - Keep the admin listener on loopback/WireGuard/Tailscale; never publish port 8318.
