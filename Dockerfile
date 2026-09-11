@@ -1,7 +1,10 @@
 FROM rust:1.93-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
+COPY .docker/cache-src ./src
+RUN cargo build --locked --release
 COPY src ./src
+RUN find src -type f -exec touch {} +
 RUN cargo build --locked --release
 
 FROM gcr.io/distroless/cc-debian12:nonroot
@@ -9,4 +12,3 @@ COPY --from=build /build/target/release/cliproxyapi-rs /usr/local/bin/cliproxyap
 EXPOSE 8317 8318
 ENTRYPOINT ["/usr/local/bin/cliproxyapi-rs"]
 CMD ["--config", "/etc/cliproxyapi/config.yaml"]
-
