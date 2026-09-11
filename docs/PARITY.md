@@ -46,7 +46,7 @@ row below is complete and the full parity suite passes.
 | Images and video | OpenAI-compatible images plus xAI/OpenAI video create/edit/extend/retrieve/content | Missing |
 | Providers | Codex, Claude, Gemini/AI Studio, Antigravity, Vertex, Kimi, xAI, OpenAI-compatible backends | Partial; Codex OAuth files only |
 | OAuth | Provider login flows, callbacks, sessions, refresh, cancellation, relogin | Partial; existing Codex refresh tokens only |
-| Credential routing | Round-robin/fill-first, weights, model aliases, exclusions, session affinity, cooldowns and bounded retries | Partial; round-robin and bounded retry |
+| Credential routing | Round-robin/fill-first, weights, model aliases, exclusions, session affinity, cooldowns and bounded retries | Partial; three core strategies, bounded retry and bounded basic session affinity |
 | Usage and quota | Per-key/provider accounting, usage queue, quota refresh/reset, cooldown state | Missing; empty compatibility response only |
 | Management API | Full built-in route set and exact CPAMP behavior | Partial; core auth-file/config/API-call routes |
 | Logging | Request/error logs, rotation, lookup/download and redaction | Missing |

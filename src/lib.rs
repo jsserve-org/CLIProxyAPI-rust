@@ -4,6 +4,7 @@ pub mod config;
 pub mod error;
 pub mod management;
 pub mod proxy;
+pub mod routing;
 pub mod security;
 
 use std::sync::Arc;
@@ -26,6 +27,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub auth: Arc<AuthStore>,
     pub client: reqwest::Client,
+    pub routing: Arc<routing::RoutingState>,
 }
 
 impl AppState {
@@ -43,6 +45,7 @@ impl AppState {
         }
         let client = builder.build()?;
         Ok(Self {
+            routing: Arc::new(routing::RoutingState::new(&config)?),
             config: Arc::new(config),
             auth,
             client,

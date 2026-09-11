@@ -16,7 +16,10 @@ Implemented:
 - Local `POST /v1/messages/count_tokens` using the same O200k input-segment
   policy as the pinned Go Codex executor
 - `/backend-api/codex/{responses,responses/compact,alpha/search}`
-- Round-robin Codex account selection and bounded retry/failover
+- Round-robin, smooth weighted round-robin, or fill-first Codex account
+  selection and bounded retry/failover
+- Opt-in bounded session affinity for explicit Claude/Codex/client session
+  signals and stable initial-message fallback, with automatic failover release
 - On-demand refresh of existing Codex OAuth refresh tokens after an upstream 401
 - Streaming upstream responses without buffering them in memory
 - CPAMP essentials: config validation, auth-file list/upload/download/delete,
@@ -31,6 +34,7 @@ criteria, subsystem status, and porting order are tracked in
 - Interactive OAuth login/device authorization (existing refresh tokens are supported)
 - Chat Completions, Gemini, Anthropic, realtime, image/video, plugins, and Home
 - Full usage accounting and the remaining CLIProxyAPI management routes
+- The complete upstream hierarchical/LCP session-affinity behavior
 
 Unknown management paths return `501 Not Implemented`. Public unknown paths
 and unsupported methods always return an empty `404`. Do not replace a full

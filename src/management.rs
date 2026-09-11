@@ -25,6 +25,7 @@ pub async fn config(State(state): State<AppState>) -> impl IntoResponse {
         "proxy-url": state.config.proxy_url,
         "request-retry": state.config.request_retry,
         "max-concurrency": state.config.max_concurrency,
+        "routing": state.config.routing,
     }))
 }
 

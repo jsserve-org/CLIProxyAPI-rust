@@ -68,6 +68,7 @@ pub struct Config {
     pub redis_usage_queue_retention_seconds: usize,
     pub proxy_url: String,
     pub management_allowed_hosts: Vec<String>,
+    pub routing: RoutingConfig,
 }
 
 impl Default for Config {
@@ -89,6 +90,27 @@ impl Default for Config {
             redis_usage_queue_retention_seconds: 60,
             proxy_url: String::new(),
             management_allowed_hosts: default_management_hosts(),
+            routing: RoutingConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct RoutingConfig {
+    pub strategy: String,
+    pub session_affinity: bool,
+    pub session_affinity_ttl: String,
+    pub session_affinity_subagents: Option<bool>,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            strategy: "round-robin".into(),
+            session_affinity: false,
+            session_affinity_ttl: "1h".into(),
+            session_affinity_subagents: Some(true),
         }
     }
 }
@@ -127,6 +149,20 @@ impl Config {
         if self.api_keys.is_empty() {
             bail!("at least one api-key is required");
         }
+        match self.routing.strategy.trim().to_ascii_lowercase().as_str() {
+            "round-robin"
+            | "roundrobin"
+            | "rr"
+            | "weighted-round-robin"
+            | "weighted"
+            | "wrr"
+            | "fill-first"
+            | "fillfirst"
+            | "ff" => {}
+            _ => bail!("unsupported routing.strategy"),
+        }
+        humantime::parse_duration(&self.routing.session_affinity_ttl)
+            .context("invalid routing.session-affinity-ttl")?;
         let parsed = url::Url::parse(&self.upstream_url).context("invalid upstream-url")?;
         if parsed.scheme() != "https" {
             bail!("upstream-url must use HTTPS");

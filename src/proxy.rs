@@ -85,17 +85,20 @@ pub(crate) async fn execute_codex(
     bytes: Bytes,
     upstream_path: &str,
 ) -> Result<reqwest::Response, AppError> {
-    let candidates = state.auth.candidates().await;
-    if candidates.is_empty() {
+    let values = state.auth.list().await;
+    let order = state.routing.candidates(&values, headers, &bytes);
+    if order.credentials.is_empty() {
         return Err(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "no enabled Codex credentials",
         ));
     }
-    let attempts = (state.config.request_retry + 1).min(candidates.len());
+    let attempts = (state.config.request_retry + 1).min(order.credentials.len());
     let mut last_status = StatusCode::BAD_GATEWAY;
-    for mut credential in candidates.into_iter().take(attempts) {
-        let mut response = send(
+    for credential in order.credentials.iter().take(attempts) {
+        let mut credential = credential.clone();
+        state.routing.bind(&order, &credential);
+        let mut response = match send(
             state,
             method,
             headers,
@@ -103,12 +106,20 @@ pub(crate) async fn execute_codex(
             upstream_path,
             &credential,
         )
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(credential = %credential.name, ?error, "trying next credential after transport failure");
+                state.routing.release(&order, &credential);
+                continue;
+            }
+        };
         if response.status() == StatusCode::UNAUTHORIZED {
             match state.auth.refresh(&state.client, &credential).await {
                 Ok(Some(refreshed)) => {
                     credential = refreshed;
-                    response = send(
+                    response = match send(
                         state,
                         method,
                         headers,
@@ -116,7 +127,15 @@ pub(crate) async fn execute_codex(
                         upstream_path,
                         &credential,
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
+                            tracing::warn!(credential = %credential.name, ?error, "trying next credential after refreshed-token transport failure");
+                            state.routing.release(&order, &credential);
+                            continue;
+                        }
+                    };
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -126,6 +145,7 @@ pub(crate) async fn execute_codex(
         }
         last_status = response.status();
         if should_retry(last_status) {
+            state.routing.release(&order, &credential);
             continue;
         }
         return Ok(response);
