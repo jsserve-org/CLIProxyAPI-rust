@@ -29,24 +29,70 @@ pub async fn count_tokens(
     if !payload.is_object() {
         return Err(AppError::bad_request("JSON body must be an object"));
     }
-    let count = tokio::task::spawn_blocking(move || count_claude_input_tokens(&payload))
+    let count = tokio::task::spawn_blocking(move || count_codex_input_tokens(&payload))
         .await
         .map_err(|_| AppError::bad_gateway("token counting task failed"))??;
     Ok(axum::Json(json!({"input_tokens": count})).into_response())
 }
 
 fn count_claude_input_tokens(payload: &Value) -> Result<usize, AppError> {
+    count_token_segments(collect_claude_input_token_segments(payload))
+}
+
+fn count_codex_input_tokens(payload: &Value) -> Result<usize, AppError> {
+    let translated = translate_request(payload)?;
+    count_token_segments(collect_codex_input_token_segments(&translated))
+}
+
+fn count_token_segments(segments: Vec<String>) -> Result<usize, AppError> {
     let tokenizer = CLAUDE_TOKENIZER.get_or_init(|| {
         tiktoken_rs::o200k_base().map_err(|error| format!("initialize tokenizer: {error}"))
     });
     let tokenizer = tokenizer
         .as_ref()
         .map_err(|error| AppError::bad_gateway(error.clone()))?;
-    let segments = collect_claude_input_token_segments(payload);
     if segments.is_empty() {
         return Ok(0);
     }
     Ok(tokenizer.encode_ordinary(&segments.join("\n")).len())
+}
+
+fn collect_codex_input_token_segments(payload: &Value) -> Vec<String> {
+    let mut segments = Vec::with_capacity(32);
+    push_value_string(&mut segments, payload.get("instructions"));
+    if let Some(items) = payload.get("input").and_then(Value::as_array) {
+        for item in items {
+            match item.get("type").and_then(Value::as_str) {
+                Some("message") => {
+                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        for part in parts {
+                            push_value_string(&mut segments, part.get("text"));
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    push_value_string(&mut segments, item.get("name"));
+                    push_value_string(&mut segments, item.get("arguments"));
+                }
+                Some("function_call_output") => {
+                    push_value_string(&mut segments, item.get("output"));
+                }
+                _ => push_value_string(&mut segments, item.get("text")),
+            }
+        }
+    }
+    if let Some(tools) = payload.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            push_value_string(&mut segments, tool.get("name"));
+            push_value_string(&mut segments, tool.get("description"));
+            push_json(&mut segments, tool.get("parameters"));
+        }
+    }
+    if let Some(format) = payload.pointer("/text/format") {
+        push_value_string(&mut segments, format.get("name"));
+        push_json(&mut segments, format.get("schema"));
+    }
+    segments
 }
 
 fn collect_claude_input_token_segments(payload: &Value) -> Vec<String> {
@@ -558,8 +604,140 @@ fn tool_result_text(value: Option<&Value>) -> String {
 
 fn translate_tool(tool: &Value) -> Option<Value> {
     Some(
-        json!({"type":"function","name":tool.get("name")?.as_str()?,"description":tool.get("description").and_then(Value::as_str).unwrap_or_default(),"parameters":tool.get("input_schema").cloned().unwrap_or_else(|| json!({"type":"object"})),"strict":false}),
+        json!({"type":"function","name":tool.get("name")?.as_str()?,"description":tool.get("description").and_then(Value::as_str).unwrap_or_default(),"parameters":normalize_tool_parameters(tool.get("input_schema")),"strict":false}),
     )
+}
+
+fn normalize_tool_parameters(schema: Option<&Value>) -> Value {
+    let mut schema = match schema {
+        Some(Value::Object(object)) => Value::Object(object.clone()),
+        _ => json!({"type":"object","properties":{}}),
+    };
+    strip_schema_dialect_keywords(&mut schema);
+    let Some(root) = schema.as_object_mut() else {
+        return json!({"type":"object","properties":{}});
+    };
+    let is_object = match root.get("type") {
+        None | Some(Value::Null) => {
+            root.insert("type".into(), Value::String("object".into()));
+            true
+        }
+        Some(Value::String(kind)) => kind.is_empty() || kind == "object",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some("object")),
+        _ => false,
+    };
+    if matches!(root.get("type"), Some(Value::String(kind)) if kind.is_empty()) {
+        root.insert("type".into(), Value::String("object".into()));
+    }
+    if is_object && matches!(root.get("properties"), None | Some(Value::Null)) {
+        root.insert("properties".into(), json!({}));
+    }
+    sort_json_keys(schema)
+}
+
+fn strip_schema_dialect_keywords(value: &mut Value) {
+    const MAP_KEYWORDS: &[&str] = &[
+        "properties",
+        "$defs",
+        "definitions",
+        "patternProperties",
+        "dependentSchemas",
+        "dependencies",
+    ];
+    const VALUE_KEYWORDS: &[&str] = &[
+        "items",
+        "prefixItems",
+        "contains",
+        "additionalProperties",
+        "propertyNames",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "additionalItems",
+        "contentSchema",
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "not",
+        "if",
+        "then",
+        "else",
+    ];
+    let Some(object) = value.as_object_mut() else {
+        if let Some(items) = value.as_array_mut() {
+            for item in items {
+                strip_schema_dialect_keywords(item);
+            }
+        }
+        return;
+    };
+    object.remove("$schema");
+    object.remove("$id");
+    if object
+        .get("pattern")
+        .and_then(Value::as_str)
+        .is_some_and(has_unsupported_unicode_property_escape)
+    {
+        object.remove("pattern");
+    }
+    if let Some(patterns) = object
+        .get_mut("patternProperties")
+        .and_then(Value::as_object_mut)
+    {
+        patterns.retain(|pattern, _| !has_unsupported_unicode_property_escape(pattern));
+        for schema in patterns.values_mut() {
+            strip_schema_dialect_keywords(schema);
+        }
+    }
+    for keyword in MAP_KEYWORDS {
+        if *keyword == "patternProperties" {
+            continue;
+        }
+        if let Some(schemas) = object.get_mut(*keyword).and_then(Value::as_object_mut) {
+            for schema in schemas.values_mut() {
+                strip_schema_dialect_keywords(schema);
+            }
+        }
+    }
+    for keyword in VALUE_KEYWORDS {
+        if let Some(schema) = object.get_mut(*keyword) {
+            strip_schema_dialect_keywords(schema);
+        }
+    }
+}
+
+fn has_unsupported_unicode_property_escape(pattern: &str) -> bool {
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            if index + 2 < bytes.len()
+                && matches!(bytes[index + 1], b'p' | b'P')
+                && bytes[index + 2] == b'{'
+            {
+                return true;
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    false
+}
+
+fn sort_json_keys(value: Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut entries = object.into_iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, sort_json_keys(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sort_json_keys).collect()),
+        other => other,
+    }
 }
 
 fn translate_stream(
@@ -662,8 +840,8 @@ fn sse(name: &str, payload: Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_claude_input_token_segments, count_claude_input_tokens,
-        translate_completed_response, translate_request,
+        collect_claude_input_token_segments, count_claude_input_tokens, count_codex_input_tokens,
+        normalize_tool_parameters, translate_completed_response, translate_request,
     };
     use serde_json::json;
     #[test]
@@ -780,6 +958,40 @@ mod tests {
         assert_eq!(
             count_claude_input_tokens(&base).unwrap(),
             count_claude_input_tokens(&extended).unwrap()
+        );
+    }
+
+    #[test]
+    fn codex_token_count_matches_pinned_go_executor_fixture() {
+        let payload = json!({
+            "model":"gpt-5.6-sol",
+            "system":"You are a careful coding agent. Inspect the repository before editing, preserve unrelated changes, keep memory bounded, avoid unnecessary allocations, validate every external input, and explain concrete tradeoffs.",
+            "messages":[{"role":"user","content":"Review a resource-constrained API proxy that serves several concurrent coding agents. Explain how bounded request bodies, concurrency limits, streaming backpressure, connection reuse, credential rotation, constant-time authentication, strict outbound destination validation, and graceful cancellation should work together. Include likely CPU and memory failure modes and give concise implementation guidance."}],
+            "tools":[
+                {"name":"read_file","description":"Read a file from the repository","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+                {"name":"run_command","description":"Run a bounded command","input_schema":{"type":"object","properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer"}},"required":["command"]}}
+            ]
+        });
+        assert_eq!(count_codex_input_tokens(&payload).unwrap(), 162);
+    }
+
+    #[test]
+    fn codex_tool_schema_normalization_matches_pinned_go() {
+        let normalized = normalize_tool_parameters(Some(&json!({
+            "type":"object",
+            "properties":{
+                "query":{"type":"string","pattern":"\\p{L}+","$id":"nested"}
+            },
+            "required":["query"],
+            "$schema":"https://json-schema.org/draft/2020-12/schema"
+        })));
+        assert_eq!(
+            serde_json::to_string(&normalized).unwrap(),
+            r#"{"properties":{"query":{"type":"string"}},"required":["query"],"type":"object"}"#
+        );
+        assert_eq!(
+            normalize_tool_parameters(None),
+            json!({"properties":{},"type":"object"})
         );
     }
 }
