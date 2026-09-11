@@ -1,11 +1,37 @@
 # Why this port? 
+
 Mainly for fun, since I have some usage left on my GPT subs. I decided to rewrite CLIProxyAPI to rust. However, I did realize that the Go version of CLIProxyAPI uses a lot of CPU and memory on my tiny VM, so this port also fixes that too, plus a few extra features that I want!
+
 # CLIProxyAPI Rust core
 
 This repository is a resource-conscious Rust port of the Codex hot path from
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). It reads existing
 `type: "codex"` JSON auth files and exposes a small, deliberately bounded
 compatibility surface for Codex clients and CPA Manager Plus (CPAMP).
+
+## Performance at a glance
+
+Against pinned CLIProxyAPI Go commit `09a29bd` on an Apple M4/macOS arm64,
+using optimized native binaries and the same deterministic local upstream:
+
+| Measurement | Original Go | This Rust port | Difference |
+| --- | ---: | ---: | ---: |
+| Binary size | 57 MB | 9.2 MB | 84% smaller |
+| Cold idle memory (RSS) | about 32 MB | about 3 MB | about 91% lower |
+| Extended observed-load memory | about 96 MB | about 64 MB | about 33% lower |
+| CPU, 64 delayed concurrent streams | 1.20 s | 0.43 s | about 64% lower |
+| Warm token count, 64 concurrent requests | 16,032 req/s | 69,507 req/s | 4.3x faster |
+
+Immediate loopback streams measured between 1.7x and 3.5x faster in Rust,
+depending on concurrency. When every upstream event was delayed by 2 ms,
+throughput was almost identical because upstream latency became the limit, but
+Rust still consumed substantially less proxy CPU.
+
+These are provisional results for the currently implemented Codex core, not a
+claim that an incomplete port beats the full Go application. They will be
+rerun after the parity contract passes. See
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for methodology, concurrency tables,
+limitations, and constrained-server recommendations.
 
 ## Current compatibility
 
