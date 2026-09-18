@@ -37,7 +37,9 @@ limitations, and constrained-server recommendations.
 
 Implemented:
 
-- `GET /v1/models`
+- `GET /v1/models` from a static Codex model registry (the deduplicated union of the
+  pinned upstream `codex-free`/`codex-team`/`codex-plus`/`codex-pro` tiers), returning the
+  upstream id/object/created/owned_by fields and an empty list when no credential is enabled
 - `POST /v1/responses` and `/v1/responses/compact`
 - Streaming and non-streaming `POST /v1/chat/completions` translation to the Codex
   backend, including multimodal content, function/custom tool calls, tool-name

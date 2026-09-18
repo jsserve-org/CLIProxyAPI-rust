@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod management;
 pub mod proxy;
+pub mod registry;
 pub mod routing;
 pub mod security;
 pub mod usage;
@@ -373,6 +374,24 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_owned()))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn models_are_empty_without_credentials() {
+        let response = api_router(state().await)
+            .oneshot(
+                Request::get("/v1/models")
+                    .header("authorization", "Bearer api-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({"object": "list", "data": []})
+        );
     }
 
     #[tokio::test]

@@ -33,18 +33,23 @@ pub async fn not_found() -> StatusCode {
 }
 
 pub async fn models(State(state): State<AppState>) -> impl IntoResponse {
-    let count = state
+    let available = state
         .auth
         .list()
         .await
         .iter()
         .filter(|item| !item.disabled)
-        .count();
-    axum::Json(json!({"object":"list", "data":[
-        {"id":"gpt-5.6-sol","object":"model","owned_by":"openai","available_credentials":count},
-        {"id":"gpt-5.6-terra","object":"model","owned_by":"openai","available_credentials":count},
-        {"id":"gpt-5.6-luna","object":"model","owned_by":"openai","available_credentials":count}
-    ]}))
+        .count()
+        > 0;
+    let data: Vec<Value> = if available {
+        crate::registry::available_models("openai")
+            .iter()
+            .map(|model| model.public_entry())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    axum::Json(json!({"object":"list", "data":data}))
 }
 
 pub async fn responses(
