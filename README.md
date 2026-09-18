@@ -37,21 +37,54 @@ limitations, and constrained-server recommendations.
 
 Implemented:
 
-- `GET /v1/models`
+- `GET /v1/models` from a static Codex model registry (the deduplicated union of the
+  pinned upstream `codex-free`/`codex-team`/`codex-plus`/`codex-pro` tiers), returning the
+  upstream id/object/created/owned_by fields and an empty list when no credential is enabled
 - `POST /v1/responses` and `/v1/responses/compact`
+- Streaming and non-streaming `POST /v1/chat/completions` translation to the Codex
+  backend, including multimodal content, function/custom tool calls, tool-name
+  shortening/restoration, structured outputs, reasoning summaries, generated images,
+  and usage accounting; legacy `POST /v1/completions` is adapted on top
 - Streaming and non-streaming `POST /v1/messages` translation for Claude Code text, images,
   tool calls/results, and basic reasoning settings
 - Local `POST /v1/messages/count_tokens` using the same O200k input-segment
   policy as the pinned Go Codex executor
 - `/backend-api/codex/{responses,responses/compact,alpha/search}`
+- `GET /v1/responses` and `/backend-api/codex/responses` WebSocket transport: each
+  downstream message is forwarded to Codex and upstream events are streamed back as JSON
+  text frames, with multiple turns per socket. Follow-up `response.append` and incremental
+  `response.create` turns are merged with the previous request input and response output
+  into a full transcript with call/item dedupe, and local synthetic prewarm for
+  `response.create` with `generate:false` (tool-call repair and upstream WebSocket
+  passthrough are not yet ported)
 - Round-robin, smooth weighted round-robin, or fill-first Codex account
   selection and bounded retry/failover
 - Opt-in bounded session affinity for explicit Claude/Codex/client session
   signals and stable initial-message fallback, with automatic failover release
+- Credential/model cooldowns for quota (429), auth (401/403) and transient (5xx)
+  failures with `retry-after` and exponential quota backoff, `disable-cooling`
+  and `transient-error-cooldown-seconds` controls, `/reset-quota`, and
+  `/quota-exceeded/*` management toggles
+- Automatic backtracking to a configured weaker model (`model-fallback`) when a
+  model's credentials are all cooling or the upstream keeps failing
 - On-demand refresh of existing Codex OAuth refresh tokens after an upstream 401
 - Streaming upstream responses without buffering them in memory
 - CPAMP essentials: config validation, auth-file list/upload/download/delete,
   enable/disable, reload, usage queue, and allowlisted `api-call`
+- In-memory usage accounting with bounded retention: per-request records (provider,
+  executor, model/alias, endpoint, auth, client metadata, latency/TTFT, failure detail,
+  and token breakdown parsed from the Codex `response.completed` event), plus
+  `/v0/management/usage-queue` draining and the `usage-statistics-enabled` toggle
+- Management config routes with upstream response shapes: `debug`, `logging-to-file`,
+  `logs-max-total-size-mb`, `error-logs-max-files`, `request-retry`,
+  `max-retry-credentials`, `max-retry-interval`, `force-model-prefix`, `proxy-url`,
+  `routing/strategy`, and `api-keys` list CRUD (in-memory only; not yet persisted to disk)
+- GitHub Copilot provider: device-code login (`/v0/management/copilot/device-code`
+  and `/copilot/device-token`), GitHub-to-Copilot session token exchange with cached
+  refresh, `type: "copilot"` auth files listed/refreshed/deleted via
+  `/v0/management/copilot`, and opt-in request routing for the configured
+  `copilot.models` through `api.githubcopilot.com` (chat/completions, responses,
+  and `/v1/models`)
 - Existing CLIProxyAPI Codex auth-file shape and plaintext or bcrypt management keys
 
 Not yet a one-to-one replacement. The pinned upstream revision, completion
@@ -60,8 +93,8 @@ criteria, subsystem status, and porting order are tracked in
 
 - The full set of Anthropic beta/content-block extensions
 - Interactive OAuth login/device authorization (existing refresh tokens are supported)
-- Chat Completions, Gemini, Anthropic, realtime, image/video, plugins, and Home
-- Full usage accounting and the remaining CLIProxyAPI management routes
+- Gemini, Anthropic, realtime, image/video, plugins, and Home
+- The remaining CLIProxyAPI management routes (key lists for other providers, logs, OAuth flows)
 - The complete upstream hierarchical/LCP session-affinity behavior
 
 Unknown management paths return `501 Not Implemented`. Public unknown paths
