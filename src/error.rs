@@ -40,6 +40,14 @@ impl AppError {
     }
 }
 
+impl std::fmt::Display for AppError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.message)
+    }
+}
+
+impl std::error::Error for AppError {}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         (

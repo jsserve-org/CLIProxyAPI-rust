@@ -78,10 +78,12 @@ Implemented:
   `logs-max-total-size-mb`, `error-logs-max-files`, `request-retry`,
   `max-retry-credentials`, `max-retry-interval`, `force-model-prefix`, `proxy-url`,
   `routing/strategy`, and `api-keys` list CRUD (in-memory only; not yet persisted to disk)
-- GitHub Copilot provider auth: GitHub device-code flow (`/v0/management/copilot/device-code`
+- GitHub Copilot provider: device-code login (`/v0/management/copilot/device-code`
   and `/copilot/device-token`), GitHub-to-Copilot session token exchange with cached
-  refresh, and `type: "copilot"` auth files listed/refreshed/deleted via
-  `/v0/management/copilot`; routing requests through the Copilot API is not implemented yet
+  refresh, `type: "copilot"` auth files listed/refreshed/deleted via
+  `/v0/management/copilot`, and opt-in request routing for the configured
+  `copilot.models` through `api.githubcopilot.com` (chat/completions, responses,
+  and `/v1/models`)
 - Existing CLIProxyAPI Codex auth-file shape and plaintext or bcrypt management keys
 
 Not yet a one-to-one replacement. The pinned upstream revision, completion

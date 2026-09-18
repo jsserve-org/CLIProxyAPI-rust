@@ -51,13 +51,15 @@ model-fallback:
     - gpt-5.6-luna
 
 # GitHub Copilot provider. Runs the GitHub device-code flow, exchanges the
-# GitHub token for a Copilot session token, and stores type:"copilot" auth
-# files. Request execution through the Copilot API is not wired up yet.
+# GitHub token for a Copilot session token, stores type:"copilot" auth files,
+# and routes the models listed below to api.githubcopilot.com. Leave `models`
+# empty to keep Copilot routing disabled.
 copilot:
   enabled: false
   client-id: Iv1.b507a08c87ecfe98
   scope: read:user
   upstream-url: https://api.githubcopilot.com
+  models: []
 
 # CPAMP's management api-call endpoint is an SSRF capability. Only these HTTPS
 # destinations are accepted. Add an exact provider hostname if CPAMP needs it.

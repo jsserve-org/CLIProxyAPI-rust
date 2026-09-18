@@ -101,6 +101,8 @@ pub struct CopilotConfig {
     pub client_id: String,
     pub scope: String,
     pub upstream_url: String,
+    /// Model IDs routed to the Copilot provider. Empty disables Copilot routing.
+    pub models: Vec<String>,
 }
 
 impl Default for CopilotConfig {
@@ -110,6 +112,7 @@ impl Default for CopilotConfig {
             client_id: default_copilot_client_id(),
             scope: default_copilot_scope(),
             upstream_url: default_copilot_upstream(),
+            models: Vec::new(),
         }
     }
 }

@@ -63,6 +63,21 @@ async fn serve(state: AppState, request: Request, legacy: bool) -> Result<Respon
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    if !legacy && state.provider_for(&model) == crate::Provider::Copilot {
+        let body = Bytes::from(
+            serde_json::to_vec(&payload).map_err(|_| AppError::bad_request("invalid request"))?,
+        );
+        let upstream =
+            proxy::execute_copilot(&state, &Method::POST, body, "chat/completions").await?;
+        if !upstream.status().is_success() {
+            let status = upstream.status();
+            return Err(AppError::new(
+                status,
+                format!("Copilot upstream returned HTTP {status}"),
+            ));
+        }
+        return proxy::to_axum(upstream);
+    }
     // The Codex backend always streams; non-streaming clients are served by
     // aggregating the terminal `response.completed` event locally.
     let translated = convert_openai_request_to_codex(&model, &payload, true);

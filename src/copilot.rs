@@ -182,25 +182,47 @@ impl CopilotStore {
             return Ok(cached.to_owned());
         }
         let exchanged = exchange_copilot_token(client, &credential.github_token).await?;
+        self.persist_copilot_token(credential, exchanged.token, exchanged.expires_at)
+            .await
+    }
+
+    /// Force a GitHub→Copilot token exchange even when a cached token has not
+    /// yet expired (used after an upstream 401).
+    pub async fn force_refresh_copilot_token(
+        &self,
+        client: &reqwest::Client,
+        credential: &CopilotCredential,
+    ) -> Result<String, AppError> {
+        let exchanged = exchange_copilot_token(client, &credential.github_token).await?;
+        self.persist_copilot_token(credential, exchanged.token, exchanged.expires_at)
+            .await
+    }
+
+    async fn persist_copilot_token(
+        &self,
+        credential: &CopilotCredential,
+        token: String,
+        expires_at: Option<i64>,
+    ) -> Result<String, AppError> {
         let mut raw = credential.raw.clone();
-        raw.insert(
-            "copilot_token".into(),
-            Value::String(exchanged.token.clone()),
-        );
-        if let Some(expires_at) = exchanged.expires_at {
+        raw.insert("copilot_token".into(), Value::String(token.clone()));
+        if let Some(expires_at) = expires_at {
             raw.insert(
                 "copilot_expires_at".into(),
                 Value::Number(expires_at.into()),
             );
         }
-        raw.insert("last_refresh".into(), Value::String(now.to_string()));
+        raw.insert(
+            "last_refresh".into(),
+            Value::String(unix_seconds().to_string()),
+        );
         write_private_json(&credential.path, &Value::Object(raw))
             .await
             .map_err(|error| AppError::bad_gateway(format!("persist Copilot token: {error}")))?;
         self.reload().await.map_err(|error| {
             AppError::bad_gateway(format!("reload Copilot credentials: {error}"))
         })?;
-        Ok(exchanged.token)
+        Ok(token)
     }
 }
 

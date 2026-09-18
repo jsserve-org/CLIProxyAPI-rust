@@ -12,7 +12,7 @@ use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 
 use crate::{
-    AppState,
+    AppState, Provider,
     auth::Credential,
     error::AppError,
     usage::{UsageQueue, UsageRecord},
@@ -41,7 +41,7 @@ pub async fn models(State(state): State<AppState>) -> impl IntoResponse {
         .filter(|item| !item.disabled)
         .count()
         > 0;
-    let data: Vec<Value> = if available {
+    let mut data: Vec<Value> = if available {
         crate::registry::available_models("openai")
             .iter()
             .map(|model| model.public_entry())
@@ -49,6 +49,33 @@ pub async fn models(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         Vec::new()
     };
+
+    let (copilot_enabled, copilot_models) = {
+        let config = state.config();
+        (config.copilot.enabled, config.copilot.models.clone())
+    };
+    let copilot_ready = copilot_enabled
+        && state
+            .copilot
+            .list()
+            .await
+            .iter()
+            .any(|credential| !credential.disabled);
+    if copilot_ready {
+        for model in copilot_models {
+            let model = model.trim();
+            if model.is_empty() {
+                continue;
+            }
+            data.push(json!({
+                "id": model,
+                "object": "model",
+                "created": 0,
+                "owned_by": "github-copilot",
+            }));
+        }
+    }
+
     axum::Json(json!({"object":"list", "data":data}))
 }
 
@@ -88,9 +115,29 @@ async fn forward(
         .await
         .map_err(|_| AppError::bad_request("request body exceeds limit"))?;
     validate_json(&bytes)?;
+    if state.provider_for(&request_model(&bytes)) == Provider::Copilot {
+        if upstream_path != "responses" {
+            return Ok(StatusCode::NOT_FOUND.into_response());
+        }
+        let response = execute_copilot(&state, &parts.method, bytes, "responses").await?;
+        return to_axum(response);
+    }
     let response =
         execute_codex(&state, &parts.method, &parts.headers, bytes, upstream_path).await?;
     to_axum(response)
+}
+
+fn request_model(bytes: &[u8]) -> String {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
 }
 
 /// A bounded upstream response whose body stream optionally records usage.
@@ -579,7 +626,129 @@ fn should_retry(status: StatusCode) -> bool {
     )
 }
 
-fn to_axum(upstream: UpstreamResponse) -> Result<Response, AppError> {
+pub(crate) async fn execute_copilot(
+    state: &AppState,
+    method: &Method,
+    body: Bytes,
+    upstream_path: &str,
+) -> Result<UpstreamResponse, AppError> {
+    let credentials = state.copilot.list().await;
+    let enabled: Vec<_> = credentials
+        .iter()
+        .filter(|credential| !credential.disabled)
+        .cloned()
+        .collect();
+    if enabled.is_empty() {
+        return Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no enabled Copilot credentials",
+        ));
+    }
+    let base = state
+        .config()
+        .copilot
+        .upstream_url
+        .trim_end_matches('/')
+        .to_owned();
+    let retry_limit = state.config().request_retry;
+    let attempts = (retry_limit + 1).min(enabled.len());
+    let mut last_status = StatusCode::BAD_GATEWAY;
+    for credential in enabled.iter().take(attempts) {
+        let token = match state
+            .copilot
+            .ensure_copilot_token(&state.client, credential)
+            .await
+        {
+            Ok(token) => token,
+            Err(error) => {
+                last_status = error.status();
+                tracing::warn!(credential = %credential.name, %error, "Copilot token unavailable");
+                continue;
+            }
+        };
+        let mut response =
+            match copilot_send(state, &base, method, &body, upstream_path, &token).await {
+                Ok(response) => response,
+                Err(error) => {
+                    last_status = error.status();
+                    continue;
+                }
+            };
+        if response.status() == StatusCode::UNAUTHORIZED {
+            match state
+                .copilot
+                .force_refresh_copilot_token(&state.client, credential)
+                .await
+            {
+                Ok(token) => {
+                    match copilot_send(state, &base, method, &body, upstream_path, &token).await {
+                        Ok(retried) => response = retried,
+                        Err(error) => {
+                            last_status = error.status();
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(credential = %credential.name, %error, "Copilot token refresh failed")
+                }
+            }
+        }
+        last_status = response.status();
+        if should_retry(last_status) {
+            continue;
+        }
+        return Ok(passthrough_response(response));
+    }
+    Err(AppError::new(
+        last_status,
+        "all eligible Copilot credentials failed",
+    ))
+}
+
+async fn copilot_send(
+    state: &AppState,
+    base: &str,
+    method: &Method,
+    body: &Bytes,
+    upstream_path: &str,
+    token: &str,
+) -> Result<reqwest::Response, AppError> {
+    let url = format!("{base}/{upstream_path}");
+    state
+        .client
+        .request(method.clone(), url)
+        .header("accept", "text/event-stream")
+        .header("content-type", "application/json")
+        .header("user-agent", "GitHubCopilotChat/0.26.7")
+        .header("editor-version", "vscode/1.99.0")
+        .header("editor-plugin-version", "copilot-chat/0.26.7")
+        .header("copilot-integration-id", "vscode-chat")
+        .header("authorization", format!("Bearer {token}"))
+        .body(body.clone())
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "Copilot request failed");
+            AppError::bad_gateway("Copilot request failed")
+        })
+}
+
+fn passthrough_response(response: reqwest::Response) -> UpstreamResponse {
+    let status = response.status();
+    let headers = response.headers().clone();
+    UpstreamResponse {
+        status,
+        headers,
+        body: Box::pin(
+            response
+                .bytes_stream()
+                .map(|result| result.map_err(std::io::Error::other)),
+        ),
+    }
+}
+
+pub(crate) fn to_axum(upstream: UpstreamResponse) -> Result<Response, AppError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
     let stream = upstream.bytes_stream();

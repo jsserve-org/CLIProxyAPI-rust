@@ -70,6 +70,31 @@ impl AppState {
     pub fn config(&self) -> std::sync::RwLockReadGuard<'_, Config> {
         self.config.read().unwrap()
     }
+
+    /// Resolve which upstream provider serves a model. Copilot routing is opt-in
+    /// through `copilot.models`; everything else falls back to Codex.
+    pub fn provider_for(&self, model: &str) -> Provider {
+        let model = model.trim();
+        let config = self.config();
+        if config.copilot.enabled
+            && !model.is_empty()
+            && config
+                .copilot
+                .models
+                .iter()
+                .any(|candidate| candidate.trim() == model)
+        {
+            Provider::Copilot
+        } else {
+            Provider::Codex
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Provider {
+    Codex,
+    Copilot,
 }
 
 pub fn api_router(state: AppState) -> Router {
@@ -584,6 +609,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn copilot_routing_is_opt_in() {
+        let directory = tempdir().unwrap();
+        let config = Config {
+            auth_dir: directory.path().to_path_buf(),
+            api_keys: vec!["api-test".into()],
+            remote_management: crate::config::RemoteManagement {
+                secret_key: "admin-test".into(),
+            },
+            copilot: crate::config::CopilotConfig {
+                enabled: true,
+                models: vec!["gpt-4o".into()],
+                ..crate::config::CopilotConfig::default()
+            },
+            ..Config::default()
+        };
+        let state = AppState::new(config).await.unwrap();
+        assert_eq!(state.provider_for("gpt-4o"), super::Provider::Copilot);
+        assert_eq!(state.provider_for("gpt-5.6-sol"), super::Provider::Codex);
+        assert_eq!(state.provider_for(""), super::Provider::Codex);
     }
 
     #[tokio::test]
