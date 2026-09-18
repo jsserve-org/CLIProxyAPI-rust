@@ -6,6 +6,7 @@ pub mod error;
 pub mod management;
 pub mod proxy;
 pub mod registry;
+pub mod responses_websocket;
 pub mod routing;
 pub mod security;
 pub mod usage;
@@ -78,10 +79,17 @@ fn api_routes(state: &AppState) -> Router<AppState> {
         .route("/v1/models", get(proxy::models))
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/completions", post(chat::completions))
-        .route("/v1/responses", post(proxy::responses))
+        .route(
+            "/v1/responses",
+            get(responses_websocket::responses_websocket).post(proxy::responses),
+        )
         .route("/v1/responses/compact", post(proxy::responses_compact))
         .route("/v1/messages", post(claude::messages))
         .route("/v1/messages/count_tokens", post(claude::count_tokens))
+        .route(
+            "/backend-api/codex/responses",
+            get(responses_websocket::responses_websocket),
+        )
         .route("/backend-api/codex/{*path}", any(proxy::backend))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

@@ -50,6 +50,10 @@ Implemented:
 - Local `POST /v1/messages/count_tokens` using the same O200k input-segment
   policy as the pinned Go Codex executor
 - `/backend-api/codex/{responses,responses/compact,alpha/search}`
+- `GET /v1/responses` and `/backend-api/codex/responses` WebSocket transport: each
+  downstream message is forwarded to Codex and upstream events are streamed back as JSON
+  text frames, with multiple turns per socket (incremental-input merge, prewarm
+  handling and upstream WebSocket passthrough are not yet ported)
 - Round-robin, smooth weighted round-robin, or fill-first Codex account
   selection and bounded retry/failover
 - Opt-in bounded session affinity for explicit Claude/Codex/client session
