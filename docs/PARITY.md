@@ -47,7 +47,7 @@ row below is complete and the full parity suite passes.
 | Providers | Codex, Claude, Gemini/AI Studio, Antigravity, Vertex, Kimi, xAI, OpenAI-compatible backends | Partial; Codex OAuth files only |
 | OAuth | Provider login flows, callbacks, sessions, refresh, cancellation, relogin | Partial; existing Codex refresh tokens only |
 | Credential routing | Round-robin/fill-first, weights, model aliases, exclusions, session affinity, cooldowns and bounded retries | Partial; three core strategies, bounded retry and bounded basic session affinity |
-| Usage and quota | Per-key/provider accounting, usage queue, quota refresh/reset, cooldown state | Missing; empty compatibility response only |
+| Usage and quota | Per-key/provider accounting, usage queue, quota refresh/reset, cooldown state | Partial; in-memory usage queue (bounded retention), `/v0/management/usage-queue` draining, `usage-statistics-enabled` toggle, and per-request token/metadata records from Codex responses; per-key aggregation, quota refresh/reset and cooldowns pending |
 | Management API | Full built-in route set and exact CPAMP behavior | Partial; core auth-file/config/API-call routes |
 | Logging | Request/error logs, rotation, lookup/download and redaction | Missing |
 | Plugins | Auth, executor, model router, management/resource routes, store lifecycle and native plugin ABI | Missing |

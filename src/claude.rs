@@ -313,7 +313,7 @@ pub async fn messages(
 }
 
 async fn translate_non_stream(
-    upstream: reqwest::Response,
+    upstream: proxy::UpstreamResponse,
     requested_model: String,
     input_tokens: usize,
     max_bytes: usize,
@@ -741,7 +741,7 @@ fn sort_json_keys(value: Value) -> Value {
 }
 
 fn translate_stream(
-    upstream: reqwest::Response,
+    upstream: proxy::UpstreamResponse,
     requested_model: String,
     input_tokens: usize,
 ) -> Body {
@@ -750,7 +750,7 @@ fn translate_stream(
         let mut buffer = BytesMut::new();
         let mut state = StreamState::new(requested_model, input_tokens);
         while let Some(chunk) = input.next().await {
-            let chunk = match chunk { Ok(value) => value, Err(error) => { yield Err(std::io::Error::other(error)); break; } };
+            let chunk = match chunk { Ok(value) => value, Err(error) => { yield Err(error); break; } };
             buffer.extend_from_slice(&chunk);
             if buffer.len() > MAX_SSE_LINE && !buffer.contains(&b'\n') {
                 yield Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "upstream SSE event exceeds limit")); break;

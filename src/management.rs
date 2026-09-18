@@ -20,7 +20,7 @@ pub async fn config(State(state): State<AppState>) -> impl IntoResponse {
         "host": state.config.host, "port": state.config.port,
         "admin-host": state.config.admin_host, "admin-port": state.config.admin_port,
         "auth-dir": state.config.auth_dir, "api-keys": state.config.api_keys.iter().map(|_| "***").collect::<Vec<_>>(),
-        "usage-statistics-enabled": state.config.usage_statistics_enabled,
+        "usage-statistics-enabled": state.usage.usage_statistics_enabled(),
         "redis-usage-queue-retention-seconds": state.config.redis_usage_queue_retention_seconds,
         "proxy-url": state.config.proxy_url,
         "request-retry": state.config.request_retry,
@@ -146,8 +146,44 @@ pub async fn refresh(State(state): State<AppState>) -> Result<impl IntoResponse,
     Ok(Json(json!({"status":"ok"})))
 }
 
-pub async fn empty_usage_queue() -> impl IntoResponse {
-    Json(json!({"items":[], "cursor":""}))
+#[derive(Deserialize)]
+pub struct UsageQueueQuery {
+    count: Option<String>,
+}
+
+pub async fn usage_queue(
+    State(state): State<AppState>,
+    Query(query): Query<UsageQueueQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let count = match query.count.as_deref().map(str::trim) {
+        None | Some("") => 1,
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| AppError::bad_request("count must be a positive integer"))?,
+    };
+    Ok(Json(state.usage.pop_oldest(count)))
+}
+
+pub async fn get_usage_statistics_enabled(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({"usage-statistics-enabled": state.usage.usage_statistics_enabled()}))
+}
+
+pub async fn put_usage_statistics_enabled(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let value = body
+        .get("value")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| AppError::bad_request("invalid body"))?;
+    state.usage.set_usage_statistics_enabled(value);
+    Ok(Json(json!({"status":"ok"})))
+}
+
+pub async fn api_key_usage() -> impl IntoResponse {
+    Json(json!({}))
 }
 
 #[derive(Deserialize)]

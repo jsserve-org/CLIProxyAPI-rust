@@ -56,6 +56,10 @@ Implemented:
 - Streaming upstream responses without buffering them in memory
 - CPAMP essentials: config validation, auth-file list/upload/download/delete,
   enable/disable, reload, usage queue, and allowlisted `api-call`
+- In-memory usage accounting with bounded retention: per-request records (provider,
+  executor, model/alias, endpoint, auth, client metadata, latency/TTFT, failure detail,
+  and token breakdown parsed from the Codex `response.completed` event), plus
+  `/v0/management/usage-queue` draining and the `usage-statistics-enabled` toggle
 - Existing CLIProxyAPI Codex auth-file shape and plaintext or bcrypt management keys
 
 Not yet a one-to-one replacement. The pinned upstream revision, completion
@@ -65,7 +69,7 @@ criteria, subsystem status, and porting order are tracked in
 - The full set of Anthropic beta/content-block extensions
 - Interactive OAuth login/device authorization (existing refresh tokens are supported)
 - Gemini, Anthropic, realtime, image/video, plugins, and Home
-- Full usage accounting and the remaining CLIProxyAPI management routes
+- Quota refresh/reset, cooldown accounting, and the remaining CLIProxyAPI management routes
 - The complete upstream hierarchical/LCP session-affinity behavior
 
 Unknown management paths return `501 Not Implemented`. Public unknown paths

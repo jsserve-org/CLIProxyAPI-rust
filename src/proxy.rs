@@ -1,3 +1,6 @@
+use std::{pin::Pin, sync::Arc, time::Instant};
+
+use async_stream::stream;
 use axum::{
     body::Body,
     extract::{Path, Request, State},
@@ -5,10 +8,17 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 
-use crate::{AppState, auth::Credential, error::AppError};
+use crate::{
+    AppState,
+    auth::Credential,
+    error::AppError,
+    usage::{UsageQueue, UsageRecord},
+};
+
+const MAX_SSE_LINE: usize = 4 * 1024 * 1024;
 
 pub async fn health() -> impl IntoResponse {
     axum::Json(json!({"status": "ok"}))
@@ -78,16 +88,48 @@ async fn forward(
     to_axum(response)
 }
 
+/// A bounded upstream response whose body stream optionally records usage.
+pub struct UpstreamResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+}
+
+impl UpstreamResponse {
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    pub fn bytes_stream(self) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
+        self.body
+    }
+}
+
 pub(crate) async fn execute_codex(
     state: &AppState,
     method: &Method,
     headers: &HeaderMap,
     bytes: Bytes,
     upstream_path: &str,
-) -> Result<reqwest::Response, AppError> {
+) -> Result<UpstreamResponse, AppError> {
+    let started = Instant::now();
     let values = state.auth.list().await;
     let order = state.routing.candidates(&values, headers, &bytes);
     if order.credentials.is_empty() {
+        record_failure(
+            state,
+            headers,
+            &bytes,
+            upstream_path,
+            None,
+            started,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no enabled Codex credentials",
+        );
         return Err(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "no enabled Codex credentials",
@@ -148,8 +190,26 @@ pub(crate) async fn execute_codex(
             state.routing.release(&order, &credential);
             continue;
         }
-        return Ok(response);
+        return Ok(wrap_response(
+            state,
+            headers,
+            &bytes,
+            upstream_path,
+            &credential,
+            started,
+            response,
+        ));
     }
+    record_failure(
+        state,
+        headers,
+        &bytes,
+        upstream_path,
+        None,
+        started,
+        last_status,
+        "all eligible credentials failed",
+    );
     Err(AppError::new(
         last_status,
         "all eligible credentials failed",
@@ -204,6 +264,189 @@ async fn send(
     })
 }
 
+fn wrap_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+    upstream_path: &str,
+    credential: &Credential,
+    started: Instant,
+    response: reqwest::Response,
+) -> UpstreamResponse {
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    let inner = response.bytes_stream();
+    if state.usage.recording() {
+        let record = build_usage_record(headers, body, upstream_path, Some(credential));
+        let recorder = UsageRecorder {
+            queue: state.usage.clone(),
+            record: Some(record),
+            started,
+            buffer: Vec::new(),
+            first_byte: false,
+        };
+        let body = Box::pin(stream! {
+            let mut inner = inner;
+            let mut recorder = recorder;
+            while let Some(chunk) = inner.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        recorder.observe(&bytes);
+                        yield Ok(bytes);
+                    }
+                    Err(error) => yield Err(std::io::Error::other(error)),
+                }
+            }
+        });
+        UpstreamResponse {
+            status,
+            headers: response_headers,
+            body,
+        }
+    } else {
+        UpstreamResponse {
+            status,
+            headers: response_headers,
+            body: Box::pin(inner.map(|result| result.map_err(std::io::Error::other))),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_failure(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+    upstream_path: &str,
+    credential: Option<&Credential>,
+    started: Instant,
+    status: StatusCode,
+    message: &str,
+) {
+    if !state.usage.recording() {
+        return;
+    }
+    let mut record = build_usage_record(headers, body, upstream_path, credential);
+    record.finish_failure(
+        started.elapsed().as_millis() as i64,
+        status.as_u16() as i64,
+        message.to_owned(),
+    );
+    if let Ok(value) = serde_json::to_value(&record) {
+        state.usage.enqueue(value);
+    }
+}
+
+fn build_usage_record(
+    headers: &HeaderMap,
+    body: &Bytes,
+    upstream_path: &str,
+    credential: Option<&Credential>,
+) -> UsageRecord {
+    let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let stream = payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let reasoning_effort = payload
+        .pointer("/reasoning/effort")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("reasoning_effort").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_owned();
+    UsageRecord::new(
+        model,
+        stream,
+        reasoning_effort,
+        upstream_path.to_owned(),
+        upstream_path.to_owned(),
+        credential,
+        header_string(headers, "x-client-request-id"),
+        header_string(headers, "x-real-ip"),
+        header_string(headers, "x-forwarded-for"),
+        header_string(headers, "user-agent"),
+    )
+}
+
+fn header_string(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+struct UsageRecorder {
+    queue: Arc<UsageQueue>,
+    record: Option<UsageRecord>,
+    started: Instant,
+    buffer: Vec<u8>,
+    first_byte: bool,
+}
+
+impl UsageRecorder {
+    fn observe(&mut self, bytes: &[u8]) {
+        if !self.first_byte {
+            self.first_byte = true;
+            if let Some(record) = self.record.as_mut() {
+                record.ttft_ms = self.started.elapsed().as_millis() as i64;
+            }
+        }
+        if let Some(record) = self.record.as_mut() {
+            scan_sse_usage(bytes, &mut self.buffer, record);
+        }
+    }
+
+    fn finalize(&mut self) {
+        let Some(mut record) = self.record.take() else {
+            return;
+        };
+        record.latency_ms = self.started.elapsed().as_millis() as i64;
+        if let Ok(value) = serde_json::to_value(&record) {
+            self.queue.enqueue(value);
+        }
+    }
+}
+
+impl Drop for UsageRecorder {
+    fn drop(&mut self) {
+        self.finalize();
+    }
+}
+
+fn scan_sse_usage(chunk: &[u8], buffer: &mut Vec<u8>, record: &mut UsageRecord) {
+    if buffer.len() + chunk.len() > MAX_SSE_LINE {
+        buffer.clear();
+        return;
+    }
+    buffer.extend_from_slice(chunk);
+    while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+        let line: Vec<u8> = buffer.drain(..=position).collect();
+        let line = line.strip_suffix(b"\n").unwrap_or(&line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(data) = line.strip_prefix(b"data:") else {
+            continue;
+        };
+        let data = data.strip_prefix(b" ").unwrap_or(data);
+        if data == b"[DONE]" {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_slice::<Value>(data)
+            && matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("response.completed") | Some("response.incomplete")
+            )
+        {
+            record.apply_completed_event(&event);
+        }
+    }
+}
+
 fn validate_json(bytes: &[u8]) -> Result<(), AppError> {
     let payload: Value =
         serde_json::from_slice(bytes).map_err(|_| AppError::bad_request("invalid JSON body"))?;
@@ -220,12 +463,10 @@ fn should_retry(status: StatusCode) -> bool {
     )
 }
 
-fn to_axum(upstream: reqwest::Response) -> Result<Response, AppError> {
+fn to_axum(upstream: UpstreamResponse) -> Result<Response, AppError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    let stream = upstream
-        .bytes_stream()
-        .map(|result| result.map_err(std::io::Error::other));
+    let stream = upstream.bytes_stream();
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     for name in [

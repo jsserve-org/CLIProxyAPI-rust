@@ -804,7 +804,7 @@ fn tool_output_fallback_part(item: &Value) -> Value {
     json!({"type": "input_text", "text": text})
 }
 
-fn translate_stream(upstream: reqwest::Response, original: Value, legacy: bool) -> Body {
+fn translate_stream(upstream: proxy::UpstreamResponse, original: Value, legacy: bool) -> Body {
     let mut input = upstream.bytes_stream();
     let output = stream! {
         let mut buffer = BytesMut::new();
@@ -813,7 +813,7 @@ fn translate_stream(upstream: reqwest::Response, original: Value, legacy: bool) 
             let chunk = match chunk {
                 Ok(value) => value,
                 Err(error) => {
-                    yield Err(std::io::Error::other(error));
+                    yield Err(error);
                     break;
                 }
             };
@@ -853,7 +853,7 @@ fn translate_stream(upstream: reqwest::Response, original: Value, legacy: bool) 
 }
 
 async fn translate_non_stream(
-    upstream: reqwest::Response,
+    upstream: proxy::UpstreamResponse,
     original: &Value,
     max_bytes: usize,
     legacy: bool,

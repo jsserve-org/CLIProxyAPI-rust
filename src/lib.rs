@@ -7,6 +7,7 @@ pub mod management;
 pub mod proxy;
 pub mod routing;
 pub mod security;
+pub mod usage;
 
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ pub struct AppState {
     pub auth: Arc<AuthStore>,
     pub client: reqwest::Client,
     pub routing: Arc<routing::RoutingState>,
+    pub usage: Arc<usage::UsageQueue>,
 }
 
 impl AppState {
@@ -45,11 +47,16 @@ impl AppState {
                 builder.proxy(reqwest::Proxy::all(&config.proxy_url).context("invalid proxy-url")?);
         }
         let client = builder.build()?;
+        let usage = Arc::new(usage::UsageQueue::new(
+            config.usage_statistics_enabled,
+            config.redis_usage_queue_retention_seconds as i64,
+        ));
         Ok(Self {
             routing: Arc::new(routing::RoutingState::new(&config)?),
             config: Arc::new(config),
             auth,
             client,
+            usage,
         })
     }
 }
@@ -95,7 +102,14 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/auth-files/status", patch(management::patch_status))
         .route("/auth-files/refresh", post(management::refresh))
         .route("/api-call", post(management::api_call))
-        .route("/usage-queue", get(management::empty_usage_queue))
+        .route("/usage-queue", get(management::usage_queue))
+        .route(
+            "/usage-statistics-enabled",
+            get(management::get_usage_statistics_enabled)
+                .put(management::put_usage_statistics_enabled)
+                .patch(management::put_usage_statistics_enabled),
+        )
+        .route("/api-key-usage", get(management::api_key_usage))
         .fallback(management::not_implemented)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -174,5 +188,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn body_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn usage_statistics_toggle_round_trips() {
+        let app = admin_router(state().await);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/v0/management/usage-statistics-enabled")
+                    .header("authorization", "Bearer admin-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await["usage-statistics-enabled"],
+            serde_json::json!(false)
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put("/v0/management/usage-statistics-enabled")
+                    .header("authorization", "Bearer admin-test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"value":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::get("/v0/management/usage-statistics-enabled")
+                    .header("authorization", "Bearer admin-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(response).await["usage-statistics-enabled"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_queue_pops_records_and_rejects_bad_count() {
+        let app = state().await;
+        let usage = app.usage.clone();
+        usage.set_usage_statistics_enabled(true);
+        usage.enqueue(serde_json::json!({"id": 1}));
+        usage.enqueue(serde_json::json!({"id": 2}));
+        let router = admin_router(app);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/v0/management/usage-queue?count=2")
+                    .header("authorization", "Bearer admin-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!([{"id": 1}, {"id": 2}])
+        );
+
+        let response = router
+            .oneshot(
+                Request::get("/v0/management/usage-queue?count=0")
+                    .header("authorization", "Bearer admin-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
