@@ -9,7 +9,7 @@ pub mod routing;
 pub mod security;
 pub mod usage;
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -26,7 +26,7 @@ use config::Config;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Config>,
+    pub config: Arc<RwLock<Config>>,
     pub auth: Arc<AuthStore>,
     pub client: reqwest::Client,
     pub routing: Arc<routing::RoutingState>,
@@ -51,13 +51,18 @@ impl AppState {
             config.usage_statistics_enabled,
             config.redis_usage_queue_retention_seconds as i64,
         ));
+        let routing = Arc::new(routing::RoutingState::new(&config)?);
         Ok(Self {
-            routing: Arc::new(routing::RoutingState::new(&config)?),
-            config: Arc::new(config),
+            routing,
+            config: Arc::new(RwLock::new(config)),
             auth,
             client,
             usage,
         })
+    }
+
+    pub fn config(&self) -> std::sync::RwLockReadGuard<'_, Config> {
+        self.config.read().unwrap()
     }
 }
 
@@ -66,6 +71,8 @@ pub fn api_router(state: AppState) -> Router {
 }
 
 fn api_routes(state: &AppState) -> Router<AppState> {
+    let max_body_bytes = state.config().max_body_bytes;
+    let max_concurrency = state.config().max_concurrency;
     let protected = Router::new()
         .route("/v1/models", get(proxy::models))
         .route("/v1/chat/completions", post(chat::chat_completions))
@@ -85,11 +92,13 @@ fn api_routes(state: &AppState) -> Router<AppState> {
         .merge(protected)
         .fallback(proxy::not_found)
         .method_not_allowed_fallback(proxy::not_found)
-        .layer(DefaultBodyLimit::max(state.config.max_body_bytes))
-        .layer(ConcurrencyLimitLayer::new(state.config.max_concurrency))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .layer(ConcurrencyLimitLayer::new(max_concurrency))
 }
 
 pub fn admin_router(state: AppState) -> Router {
+    let max_body_bytes = state.config().max_body_bytes;
+    let max_concurrency = state.config().max_concurrency;
     let management = Router::new()
         .route("/config", get(management::config))
         .route(
@@ -110,16 +119,84 @@ pub fn admin_router(state: AppState) -> Router {
                 .patch(management::put_usage_statistics_enabled),
         )
         .route("/api-key-usage", get(management::api_key_usage))
+        .route(
+            "/debug",
+            get(management::get_debug)
+                .put(management::put_debug)
+                .patch(management::put_debug),
+        )
+        .route(
+            "/logging-to-file",
+            get(management::get_logging_to_file)
+                .put(management::put_logging_to_file)
+                .patch(management::put_logging_to_file),
+        )
+        .route(
+            "/logs-max-total-size-mb",
+            get(management::get_logs_max_total_size_mb)
+                .put(management::put_logs_max_total_size_mb)
+                .patch(management::put_logs_max_total_size_mb),
+        )
+        .route(
+            "/error-logs-max-files",
+            get(management::get_error_logs_max_files)
+                .put(management::put_error_logs_max_files)
+                .patch(management::put_error_logs_max_files),
+        )
+        .route(
+            "/request-retry",
+            get(management::get_request_retry)
+                .put(management::put_request_retry)
+                .patch(management::put_request_retry),
+        )
+        .route(
+            "/max-retry-credentials",
+            get(management::get_max_retry_credentials)
+                .put(management::put_max_retry_credentials)
+                .patch(management::put_max_retry_credentials),
+        )
+        .route(
+            "/max-retry-interval",
+            get(management::get_max_retry_interval)
+                .put(management::put_max_retry_interval)
+                .patch(management::put_max_retry_interval),
+        )
+        .route(
+            "/force-model-prefix",
+            get(management::get_force_model_prefix)
+                .put(management::put_force_model_prefix)
+                .patch(management::put_force_model_prefix),
+        )
+        .route(
+            "/proxy-url",
+            get(management::get_proxy_url)
+                .put(management::put_proxy_url)
+                .patch(management::put_proxy_url)
+                .delete(management::delete_proxy_url),
+        )
+        .route(
+            "/routing/strategy",
+            get(management::get_routing_strategy)
+                .put(management::put_routing_strategy)
+                .patch(management::put_routing_strategy),
+        )
+        .route(
+            "/api-keys",
+            get(management::get_api_keys)
+                .put(management::put_api_keys)
+                .patch(management::patch_api_keys)
+                .delete(management::delete_api_keys),
+        )
         .fallback(management::not_implemented)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             security::require_management_key,
         ));
-    api_routes(&state)
+    let router = api_routes(&state)
         .nest("/v0/management", management)
-        .layer(DefaultBodyLimit::max(state.config.max_body_bytes))
-        .layer(ConcurrencyLimitLayer::new(state.config.max_concurrency))
-        .with_state(state)
+        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .layer(ConcurrencyLimitLayer::new(max_concurrency));
+    router.with_state(state)
 }
 
 #[cfg(test)]
@@ -279,5 +356,176 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn admin_get(uri: &str) -> Request<Body> {
+        Request::get(uri)
+            .header("authorization", "Bearer admin-test")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn admin_json(method: &str, uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", "Bearer admin-test")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn management_config_toggles_round_trip() {
+        let app = admin_router(state().await);
+        let response = app
+            .clone()
+            .oneshot(admin_get("/v0/management/debug"))
+            .await
+            .unwrap();
+        assert_eq!(body_json(response).await["debug"], serde_json::json!(false));
+
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "PUT",
+                "/v0/management/debug",
+                r#"{"value":true}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(admin_get("/v0/management/request-retry"))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(response).await["request-retry"],
+            serde_json::json!(2)
+        );
+
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "PATCH",
+                "/v0/management/request-retry",
+                r#"{"value":5}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .oneshot(admin_get("/v0/management/request-retry"))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(response).await["request-retry"],
+            serde_json::json!(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn management_routing_strategy_validates_and_normalizes() {
+        let app = admin_router(state().await);
+        let response = app
+            .clone()
+            .oneshot(admin_get("/v0/management/routing/strategy"))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(response).await["strategy"],
+            serde_json::json!("round-robin")
+        );
+
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "PUT",
+                "/v0/management/routing/strategy",
+                r#"{"value":"wrr"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(admin_get("/v0/management/routing/strategy"))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(response).await["strategy"],
+            serde_json::json!("weighted-round-robin")
+        );
+
+        let response = app
+            .oneshot(admin_json(
+                "PUT",
+                "/v0/management/routing/strategy",
+                r#"{"value":"bogus"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn management_api_keys_lifecycle() {
+        let app = admin_router(state().await);
+        let response = app
+            .clone()
+            .oneshot(admin_get("/v0/management/api-keys"))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(response).await["api-keys"],
+            serde_json::json!(["api-test"])
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put("/v0/management/api-keys")
+                    .header("authorization", "Bearer admin-test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"["k1","k2"]"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "PATCH",
+                "/v0/management/api-keys",
+                r#"{"old":"k1","new":"k3"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(admin_get("/v0/management/api-keys"))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(response).await["api-keys"],
+            serde_json::json!(["k3", "k2"])
+        );
+
+        let response = app
+            .oneshot(
+                Request::delete("/v0/management/api-keys?value=k2")
+                    .header("authorization", "Bearer admin-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

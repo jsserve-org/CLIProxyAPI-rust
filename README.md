@@ -60,6 +60,10 @@ Implemented:
   executor, model/alias, endpoint, auth, client metadata, latency/TTFT, failure detail,
   and token breakdown parsed from the Codex `response.completed` event), plus
   `/v0/management/usage-queue` draining and the `usage-statistics-enabled` toggle
+- Management config routes with upstream response shapes: `debug`, `logging-to-file`,
+  `logs-max-total-size-mb`, `error-logs-max-files`, `request-retry`,
+  `max-retry-credentials`, `max-retry-interval`, `force-model-prefix`, `proxy-url`,
+  `routing/strategy`, and `api-keys` list CRUD (in-memory only; not yet persisted to disk)
 - Existing CLIProxyAPI Codex auth-file shape and plaintext or bcrypt management keys
 
 Not yet a one-to-one replacement. The pinned upstream revision, completion

@@ -29,7 +29,7 @@ pub async fn completions(
     request: Request,
 ) -> Result<Response, AppError> {
     let (parts, body) = request.into_parts();
-    let max = state.config.max_body_bytes;
+    let max = state.config().max_body_bytes;
     let bytes = axum::body::to_bytes(body, max)
         .await
         .map_err(|_| AppError::bad_request("request body exceeds limit"))?;
@@ -48,7 +48,7 @@ pub async fn completions(
 
 async fn serve(state: AppState, request: Request, legacy: bool) -> Result<Response, AppError> {
     let (parts, body) = request.into_parts();
-    let max = state.config.max_body_bytes;
+    let max = state.config().max_body_bytes;
     let bytes = axum::body::to_bytes(body, max)
         .await
         .map_err(|_| AppError::bad_request("request body exceeds limit"))?;

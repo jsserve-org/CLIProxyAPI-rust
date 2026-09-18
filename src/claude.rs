@@ -21,7 +21,8 @@ pub async fn count_tokens(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Response, AppError> {
-    let bytes = axum::body::to_bytes(request.into_body(), state.config.max_body_bytes)
+    let max_body_bytes = state.config().max_body_bytes;
+    let bytes = axum::body::to_bytes(request.into_body(), max_body_bytes)
         .await
         .map_err(|_| AppError::bad_request("request body exceeds limit"))?;
     let payload: Value =
@@ -262,8 +263,9 @@ pub async fn messages(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Response, AppError> {
+    let max_body_bytes = state.config().max_body_bytes;
     let (parts, body) = request.into_parts();
-    let input = axum::body::to_bytes(body, state.config.max_body_bytes)
+    let input = axum::body::to_bytes(body, max_body_bytes)
         .await
         .map_err(|_| AppError::bad_request("request body exceeds limit"))?;
     let payload: Value =
@@ -297,8 +299,7 @@ pub async fn messages(
         ));
     }
     if !stream {
-        return translate_non_stream(upstream, model, input_tokens, state.config.max_body_bytes)
-            .await;
+        return translate_non_stream(upstream, model, input_tokens, max_body_bytes).await;
     }
     let body = translate_stream(upstream, model, input_tokens);
     let mut response = Response::new(body);

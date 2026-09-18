@@ -69,6 +69,13 @@ pub struct Config {
     pub proxy_url: String,
     pub management_allowed_hosts: Vec<String>,
     pub routing: RoutingConfig,
+    pub debug: bool,
+    pub logging_to_file: bool,
+    pub logs_max_total_size_mb: usize,
+    pub error_logs_max_files: usize,
+    pub max_retry_credentials: usize,
+    pub max_retry_interval: u64,
+    pub force_model_prefix: bool,
 }
 
 impl Default for Config {
@@ -91,6 +98,13 @@ impl Default for Config {
             proxy_url: String::new(),
             management_allowed_hosts: default_management_hosts(),
             routing: RoutingConfig::default(),
+            debug: false,
+            logging_to_file: false,
+            logs_max_total_size_mb: 0,
+            error_logs_max_files: 10,
+            max_retry_credentials: 0,
+            max_retry_interval: 0,
+            force_model_prefix: false,
         }
     }
 }

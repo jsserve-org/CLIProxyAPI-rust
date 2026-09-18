@@ -78,7 +78,7 @@ async fn forward(
     upstream_path: &str,
 ) -> Result<Response, AppError> {
     let (parts, body) = request.into_parts();
-    let max = state.config.max_body_bytes;
+    let max = state.config().max_body_bytes;
     let bytes = axum::body::to_bytes(body, max)
         .await
         .map_err(|_| AppError::bad_request("request body exceeds limit"))?;
@@ -135,7 +135,7 @@ pub(crate) async fn execute_codex(
             "no enabled Codex credentials",
         ));
     }
-    let attempts = (state.config.request_retry + 1).min(order.credentials.len());
+    let attempts = (state.config().request_retry + 1).min(order.credentials.len());
     let mut last_status = StatusCode::BAD_GATEWAY;
     for credential in order.credentials.iter().take(attempts) {
         let mut credential = credential.clone();
@@ -226,7 +226,7 @@ async fn send(
 ) -> Result<reqwest::Response, AppError> {
     let url = format!(
         "{}/{}",
-        state.config.upstream_url.trim_end_matches('/'),
+        state.config().upstream_url.trim_end_matches('/'),
         path
     );
     let mut request = state
