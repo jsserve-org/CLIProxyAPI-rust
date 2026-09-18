@@ -17,11 +17,21 @@ use crate::{auth::Credential, config::Config};
 
 const MAX_SESSION_ENTRIES: usize = 65_536;
 const MAX_EXPLICIT_ID_BYTES: usize = 256;
+const AUTH_SCOPE: &str = "*";
+const DEFAULT_TRANSIENT_COOLDOWN_SECS: u64 = 60;
+const MIN_QUOTA_COOLDOWN_SECS: u64 = 10;
+const QUOTA_BACKOFF_MAX_SECS: u64 = 30 * 60;
 
 #[derive(Clone)]
 struct Binding {
     auth_index: String,
     expires_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct Cooldown {
+    until: Instant,
+    backoff_level: u32,
 }
 
 pub struct RoutingState {
@@ -32,6 +42,9 @@ pub struct RoutingState {
     cursor: AtomicUsize,
     sessions: Mutex<LruCache<String, Binding>>,
     weighted_current: Mutex<HashMap<String, i64>>,
+    cooldowns: Mutex<HashMap<String, Cooldown>>,
+    disable_cooling: bool,
+    transient_cooldown_seconds: i64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,7 +78,91 @@ impl RoutingState {
                 NonZeroUsize::new(MAX_SESSION_ENTRIES).unwrap(),
             )),
             weighted_current: Mutex::new(HashMap::new()),
+            cooldowns: Mutex::new(HashMap::new()),
+            disable_cooling: config.disable_cooling,
+            transient_cooldown_seconds: config.transient_error_cooldown_seconds,
         })
+    }
+
+    /// Record the outcome of a credential/model attempt and update cooldowns.
+    /// A failure only extends a still-live deadline; it never shortens one.
+    pub fn record_result(
+        &self,
+        credential: &Credential,
+        model: &str,
+        success: bool,
+        status: Option<u16>,
+        retry_after: Option<Duration>,
+    ) {
+        if self.disable_cooling {
+            return;
+        }
+        let now = Instant::now();
+        let mut map = self
+            .cooldowns
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if success {
+            map.remove(&cooldown_key(&credential.auth_index, model));
+            map.remove(&cooldown_key(&credential.auth_index, AUTH_SCOPE));
+            return;
+        }
+        let status = status.unwrap_or(502);
+        let key = cooldown_key(
+            &credential.auth_index,
+            match status {
+                401..=403 => AUTH_SCOPE,
+                _ => model,
+            },
+        );
+        let existing = map.get(&key).copied();
+        let duration = match status {
+            401..=403 => Some(Duration::from_secs(30 * 60)),
+            404 => Some(Duration::from_secs(12 * 60 * 60)),
+            429 => {
+                if let Some(retry_after) = retry_after {
+                    Some(retry_after.max(Duration::from_secs(MIN_QUOTA_COOLDOWN_SECS)))
+                } else {
+                    let level = existing.map(|entry| entry.backoff_level).unwrap_or(0);
+                    Some(quota_backoff(level))
+                }
+            }
+            _ => self.transient_duration(),
+        };
+        let Some(duration) = duration else {
+            return;
+        };
+        let until = now + duration;
+        let entry = map.entry(key).or_insert(Cooldown {
+            until,
+            backoff_level: 0,
+        });
+        if entry.until < until {
+            entry.until = until;
+        }
+        if status == 429 {
+            entry.backoff_level = existing.map(|entry| entry.backoff_level + 1).unwrap_or(1);
+        }
+    }
+
+    /// Clear all cooldown state for one credential (management `reset-quota`).
+    pub fn reset_quota(&self, auth_index: &str) -> usize {
+        let prefix = format!("{auth_index}|");
+        let mut map = self
+            .cooldowns
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let before = map.len();
+        map.retain(|key, _| !key.starts_with(&prefix));
+        before - map.len()
+    }
+
+    fn transient_duration(&self) -> Option<Duration> {
+        match self.transient_cooldown_seconds {
+            seconds if seconds < 0 => None,
+            0 => Some(Duration::from_secs(DEFAULT_TRANSIENT_COOLDOWN_SECS)),
+            seconds => Some(Duration::from_secs(seconds as u64)),
+        }
     }
 
     pub fn candidates(
@@ -79,6 +176,16 @@ impl RoutingState {
             .filter(|credential| !credential.disabled)
             .cloned()
             .collect();
+        let model = request_model(body);
+        let now = Instant::now();
+        {
+            let cooldowns = self
+                .cooldowns
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            credentials
+                .retain(|credential| !cooling_in(&cooldowns, &credential.auth_index, &model, now));
+        }
         if credentials.is_empty() {
             return CandidateOrder {
                 credentials,
@@ -192,6 +299,31 @@ impl RoutingState {
         }
         credentials.rotate_left(picked);
     }
+}
+
+fn cooldown_key(auth_index: &str, scope: &str) -> String {
+    format!("{auth_index}|{scope}")
+}
+
+fn cooling_in(
+    cooldowns: &HashMap<String, Cooldown>,
+    auth_index: &str,
+    model: &str,
+    now: Instant,
+) -> bool {
+    let model_active = cooldowns
+        .get(&cooldown_key(auth_index, model))
+        .is_some_and(|entry| entry.until > now);
+    let auth_active = cooldowns
+        .get(&cooldown_key(auth_index, AUTH_SCOPE))
+        .is_some_and(|entry| entry.until > now);
+    model_active || auth_active
+}
+
+fn quota_backoff(level: u32) -> Duration {
+    let shift = level.min(20);
+    let seconds = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
+    Duration::from_secs(seconds.min(QUOTA_BACKOFF_MAX_SECS))
 }
 
 fn request_model(body: &[u8]) -> String {
@@ -378,7 +510,11 @@ fn text_content(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use axum::http::HeaderMap;
     use serde_json::{Map, json};
@@ -471,6 +607,92 @@ mod tests {
                 .bound_auth("codex::codex:session-a::gpt-test")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn quota_failure_cools_model_and_reset_restores() {
+        let config = Config::default();
+        let routing = RoutingState::new(&config).unwrap();
+        let credentials = vec![credential("one"), credential("two")];
+        let headers = HeaderMap::new();
+        let body = serde_json::to_vec(&json!({"model":"gpt-test"})).unwrap();
+        let first = routing.candidates(&credentials, &headers, &body);
+        for selected in &first.credentials {
+            routing.record_result(selected, "gpt-test", false, Some(429), None);
+        }
+        assert!(
+            routing
+                .candidates(&credentials, &headers, &body)
+                .credentials
+                .is_empty()
+        );
+        routing.reset_quota("one");
+        let remaining = routing.candidates(&credentials, &headers, &body);
+        assert_eq!(remaining.credentials.len(), 1);
+        assert_eq!(remaining.credentials[0].auth_index, "one");
+        routing.record_result(&credentials[1], "gpt-test", true, Some(200), None);
+        assert_eq!(
+            routing
+                .candidates(&credentials, &headers, &body)
+                .credentials
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn auth_scope_failure_blocks_every_model() {
+        let config = Config::default();
+        let routing = RoutingState::new(&config).unwrap();
+        let credentials = vec![credential("one"), credential("two")];
+        let headers = HeaderMap::new();
+        routing.record_result(&credentials[0], "gpt-test", false, Some(401), None);
+        for model in ["gpt-test", "gpt-other"] {
+            let body = serde_json::to_vec(&json!({"model": model})).unwrap();
+            let order = routing.candidates(&credentials, &headers, &body);
+            assert_eq!(order.credentials.len(), 1);
+            assert_eq!(order.credentials[0].auth_index, "two");
+        }
+    }
+
+    #[test]
+    fn disable_cooling_keeps_credentials_available() {
+        let config = Config {
+            disable_cooling: true,
+            ..Config::default()
+        };
+        let routing = RoutingState::new(&config).unwrap();
+        let credentials = vec![credential("one")];
+        let headers = HeaderMap::new();
+        let body = serde_json::to_vec(&json!({"model": "gpt-test"})).unwrap();
+        routing.record_result(&credentials[0], "gpt-test", false, Some(429), None);
+        assert_eq!(
+            routing
+                .candidates(&credentials, &headers, &body)
+                .credentials
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn quota_retry_after_is_respected_with_floor() {
+        let config = Config::default();
+        let routing = RoutingState::new(&config).unwrap();
+        let credential = credential("one");
+        routing.record_result(
+            &credential,
+            "gpt-test",
+            false,
+            Some(429),
+            Some(Duration::from_secs(2)),
+        );
+        let cooldowns = routing.cooldowns.lock().unwrap();
+        let entry = cooldowns
+            .get(&super::cooldown_key("one", "gpt-test"))
+            .unwrap();
+        let remaining = entry.until.saturating_duration_since(Instant::now());
+        assert!(remaining >= Duration::from_secs(9));
     }
 
     #[test]

@@ -177,6 +177,19 @@ pub fn admin_router(state: AppState) -> Router {
                 .patch(management::put_force_model_prefix),
         )
         .route(
+            "/quota-exceeded/switch-project",
+            get(management::get_switch_project)
+                .put(management::put_switch_project)
+                .patch(management::put_switch_project),
+        )
+        .route(
+            "/quota-exceeded/switch-preview-model",
+            get(management::get_switch_preview_model)
+                .put(management::put_switch_preview_model)
+                .patch(management::put_switch_preview_model),
+        )
+        .route("/reset-quota", post(management::reset_quota))
+        .route(
             "/proxy-url",
             get(management::get_proxy_url)
                 .put(management::put_proxy_url)
@@ -554,5 +567,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn management_quota_routes() {
+        let app = admin_router(state().await);
+        let response = app
+            .clone()
+            .oneshot(admin_get("/v0/management/quota-exceeded/switch-project"))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(response).await["switch-project"],
+            serde_json::json!(false)
+        );
+
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "PUT",
+                "/v0/management/quota-exceeded/switch-preview-model",
+                r#"{"value":true}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(admin_get(
+                "/v0/management/quota-exceeded/switch-preview-model",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            body_json(response).await["switch-preview-model"],
+            serde_json::json!(true)
+        );
+
+        let response = app
+            .clone()
+            .oneshot(admin_json("POST", "/v0/management/reset-quota", r#"{}"#))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(admin_json(
+                "POST",
+                "/v0/management/reset-quota",
+                r#"{"auth_index":"missing"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

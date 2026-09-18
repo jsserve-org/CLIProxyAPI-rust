@@ -58,6 +58,12 @@ Implemented:
   selection and bounded retry/failover
 - Opt-in bounded session affinity for explicit Claude/Codex/client session
   signals and stable initial-message fallback, with automatic failover release
+- Credential/model cooldowns for quota (429), auth (401/403) and transient (5xx)
+  failures with `retry-after` and exponential quota backoff, `disable-cooling`
+  and `transient-error-cooldown-seconds` controls, `/reset-quota`, and
+  `/quota-exceeded/*` management toggles
+- Automatic backtracking to a configured weaker model (`model-fallback`) when a
+  model's credentials are all cooling or the upstream keeps failing
 - On-demand refresh of existing Codex OAuth refresh tokens after an upstream 401
 - Streaming upstream responses without buffering them in memory
 - CPAMP essentials: config validation, auth-file list/upload/download/delete,
@@ -79,7 +85,7 @@ criteria, subsystem status, and porting order are tracked in
 - The full set of Anthropic beta/content-block extensions
 - Interactive OAuth login/device authorization (existing refresh tokens are supported)
 - Gemini, Anthropic, realtime, image/video, plugins, and Home
-- Quota refresh/reset, cooldown accounting, and the remaining CLIProxyAPI management routes
+- The remaining CLIProxyAPI management routes (key lists for other providers, logs, OAuth flows)
 - The complete upstream hierarchical/LCP session-affinity behavior
 
 Unknown management paths return `501 Not Implemented`. Public unknown paths

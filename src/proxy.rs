@@ -121,6 +121,46 @@ pub(crate) async fn execute_codex(
     bytes: Bytes,
     upstream_path: &str,
 ) -> Result<UpstreamResponse, AppError> {
+    let chain = model_chain(state, &bytes);
+    let total = chain.len();
+    let mut last_status = StatusCode::BAD_GATEWAY;
+    let mut last_error: Option<AppError> = None;
+    for (index, model) in chain.iter().enumerate() {
+        let body = if index == 0 {
+            bytes.clone()
+        } else {
+            rewrite_model(&bytes, model)
+        };
+        match execute_codex_model(state, method, headers, body, upstream_path, model).await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                last_status = error.status();
+                let can_fallback = index + 1 < total && should_fallback(last_status);
+                last_error = Some(error);
+                if !can_fallback {
+                    break;
+                }
+                tracing::warn!(model = %model, status = %last_status, "falling back to weaker model");
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        AppError::new(
+            last_status,
+            "all eligible credentials failed for every model",
+        )
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_codex_model(
+    state: &AppState,
+    method: &Method,
+    headers: &HeaderMap,
+    bytes: Bytes,
+    upstream_path: &str,
+    model: &str,
+) -> Result<UpstreamResponse, AppError> {
     let started = Instant::now();
     let values = state.auth.list().await;
     let order = state.routing.candidates(&values, headers, &bytes);
@@ -158,6 +198,9 @@ pub(crate) async fn execute_codex(
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(credential = %credential.name, ?error, "trying next credential after transport failure");
+                state
+                    .routing
+                    .record_result(&credential, model, false, Some(502), None);
                 state.routing.release(&order, &credential);
                 continue;
             }
@@ -179,6 +222,9 @@ pub(crate) async fn execute_codex(
                         Ok(response) => response,
                         Err(error) => {
                             tracing::warn!(credential = %credential.name, ?error, "trying next credential after refreshed-token transport failure");
+                            state
+                                .routing
+                                .record_result(&credential, model, false, Some(502), None);
                             state.routing.release(&order, &credential);
                             continue;
                         }
@@ -191,10 +237,21 @@ pub(crate) async fn execute_codex(
             }
         }
         last_status = response.status();
+        let retry_after = retry_after(&response);
         if should_retry(last_status) {
+            state.routing.record_result(
+                &credential,
+                model,
+                false,
+                Some(last_status.as_u16()),
+                retry_after,
+            );
             state.routing.release(&order, &credential);
             continue;
         }
+        state
+            .routing
+            .record_result(&credential, model, true, Some(last_status.as_u16()), None);
         return Ok(wrap_response(
             state,
             headers,
@@ -219,6 +276,60 @@ pub(crate) async fn execute_codex(
         last_status,
         "all eligible credentials failed",
     ))
+}
+
+fn model_chain(state: &AppState, bytes: &Bytes) -> Vec<String> {
+    let requested = serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned)
+        });
+    let Some(requested) = requested else {
+        return vec![String::new()];
+    };
+    let mut chain = vec![requested.clone()];
+    for candidate in state.config().model_fallback.chain(&requested) {
+        let candidate = candidate.trim().to_owned();
+        if !candidate.is_empty() && !chain.contains(&candidate) {
+            chain.push(candidate);
+        }
+    }
+    chain
+}
+
+fn rewrite_model(bytes: &Bytes, model: &str) -> Bytes {
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("model".into(), Value::String(model.to_owned()));
+            }
+            serde_json::to_vec(&value)
+                .map(Bytes::from)
+                .unwrap_or_else(|_| bytes.clone())
+        }
+        Err(_) => bytes.clone(),
+    }
+}
+
+fn retry_after(response: &reqwest::Response) -> Option<std::time::Duration> {
+    response
+        .headers()
+        .get("retry-after")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
+}
+
+fn should_fallback(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
 }
 
 async fn send(
@@ -488,4 +599,37 @@ fn to_axum(upstream: UpstreamResponse) -> Result<Response, AppError> {
         }
     }
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+    use bytes::Bytes;
+
+    use super::{rewrite_model, should_fallback};
+
+    #[test]
+    fn rewrite_model_replaces_top_level_model() {
+        let body = Bytes::from_static(br#"{"model":"a","stream":true}"#);
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&rewrite_model(&body, "b")).unwrap();
+        assert_eq!(rewritten["model"], serde_json::json!("b"));
+        assert_eq!(rewritten["stream"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn rewrite_model_leaves_non_json_unchanged() {
+        let body = Bytes::from_static(b"not json");
+        assert_eq!(rewrite_model(&body, "b"), body);
+    }
+
+    #[test]
+    fn fallback_covers_quota_cooldown_and_transient_statuses() {
+        assert!(should_fallback(StatusCode::TOO_MANY_REQUESTS));
+        assert!(should_fallback(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(should_fallback(StatusCode::BAD_GATEWAY));
+        assert!(should_fallback(StatusCode::REQUEST_TIMEOUT));
+        assert!(!should_fallback(StatusCode::BAD_REQUEST));
+        assert!(!should_fallback(StatusCode::UNAUTHORIZED));
+    }
 }

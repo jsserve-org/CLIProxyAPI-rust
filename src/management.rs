@@ -35,6 +35,10 @@ pub async fn config(State(state): State<AppState>) -> impl IntoResponse {
         "max-retry-credentials": config.max_retry_credentials,
         "max-retry-interval": config.max_retry_interval,
         "force-model-prefix": config.force_model_prefix,
+        "disable-cooling": config.disable_cooling,
+        "transient-error-cooldown-seconds": config.transient_error_cooldown_seconds,
+        "quota-exceeded": config.quota_exceeded,
+        "model-fallback": config.model_fallback,
     }))
 }
 
@@ -415,6 +419,58 @@ pub async fn put_force_model_prefix(
     let value = bool_value(&body)?;
     state.config.write().unwrap().force_model_prefix = value;
     Ok(Json(json!({"status":"ok"})))
+}
+
+pub async fn get_switch_project(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({"switch-project": state.config().quota_exceeded.switch_project}))
+}
+
+pub async fn put_switch_project(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let value = bool_value(&body)?;
+    state.config.write().unwrap().quota_exceeded.switch_project = value;
+    Ok(Json(json!({"status":"ok"})))
+}
+
+pub async fn get_switch_preview_model(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({"switch-preview-model": state.config().quota_exceeded.switch_preview_model}))
+}
+
+pub async fn put_switch_preview_model(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let value = bool_value(&body)?;
+    state
+        .config
+        .write()
+        .unwrap()
+        .quota_exceeded
+        .switch_preview_model = value;
+    Ok(Json(json!({"status":"ok"})))
+}
+
+pub async fn reset_quota(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<impl IntoResponse, AppError> {
+    let auth_index = body
+        .get("auth_index")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("auth_index is required"))?;
+    if state.auth.find_by_index(auth_index).await.is_none() {
+        return Err(AppError::not_found("auth not found"));
+    }
+    state.routing.reset_quota(auth_index);
+    Ok(Json(json!({
+        "status": "ok",
+        "auth_index": auth_index,
+        "models": [],
+    })))
 }
 
 pub async fn get_proxy_url(State(state): State<AppState>) -> impl IntoResponse {

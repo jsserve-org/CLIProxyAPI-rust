@@ -76,6 +76,39 @@ pub struct Config {
     pub max_retry_credentials: usize,
     pub max_retry_interval: u64,
     pub force_model_prefix: bool,
+    pub disable_cooling: bool,
+    pub transient_error_cooldown_seconds: i64,
+    pub quota_exceeded: QuotaExceeded,
+    pub model_fallback: ModelFallback,
+}
+
+/// Behavior when a quota limit is exceeded, mirroring upstream `quota-exceeded`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct QuotaExceeded {
+    pub switch_project: bool,
+    pub switch_preview_model: bool,
+}
+
+/// Ordered weaker-model fallback chain. `default` applies when no rule matches;
+/// a rule may also be keyed by a specific model ID.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ModelFallback {
+    #[serde(default)]
+    pub default: Vec<String>,
+    #[serde(flatten)]
+    pub rules: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl ModelFallback {
+    pub fn chain(&self, model: &str) -> Vec<String> {
+        self.rules
+            .get(model)
+            .or_else(|| self.rules.get("*"))
+            .cloned()
+            .unwrap_or_else(|| self.default.clone())
+    }
 }
 
 impl Default for Config {
@@ -105,6 +138,10 @@ impl Default for Config {
             max_retry_credentials: 0,
             max_retry_interval: 0,
             force_model_prefix: false,
+            disable_cooling: false,
+            transient_error_cooldown_seconds: 0,
+            quota_exceeded: QuotaExceeded::default(),
+            model_fallback: ModelFallback::default(),
         }
     }
 }
@@ -202,4 +239,29 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
         return Ok(PathBuf::from(home).join(text.trim_start_matches("~/")));
     }
     Ok(path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelFallback;
+
+    #[test]
+    fn model_fallback_chain_prefers_exact_then_wildcard_then_default() {
+        let fallback: ModelFallback =
+            serde_yaml::from_str("gpt-a:\n  - gpt-b\n\"*\":\n  - gpt-z\ndefault:\n  - gpt-d\n")
+                .unwrap();
+        assert_eq!(fallback.chain("gpt-a"), vec!["gpt-b"]);
+        assert_eq!(fallback.chain("gpt-x"), vec!["gpt-z"]);
+    }
+
+    #[test]
+    fn model_fallback_falls_back_to_default() {
+        let fallback: ModelFallback = serde_yaml::from_str("default:\n  - gpt-d\n").unwrap();
+        assert_eq!(fallback.chain("gpt-a"), vec!["gpt-d"]);
+    }
+
+    #[test]
+    fn empty_model_fallback_has_no_chain() {
+        assert!(ModelFallback::default().chain("gpt-a").is_empty());
+    }
 }
