@@ -54,8 +54,9 @@ Implemented:
   downstream message is forwarded to Codex and upstream events are streamed back as JSON
   text frames, with multiple turns per socket. Follow-up `response.append` and incremental
   `response.create` turns are merged with the previous request input and response output
-  into a full transcript with call/item dedupe (prewarm handling, tool-call repair and
-  upstream WebSocket passthrough are not yet ported)
+  into a full transcript with call/item dedupe, and local synthetic prewarm for
+  `response.create` with `generate:false` (tool-call repair and upstream WebSocket
+  passthrough are not yet ported)
 - Round-robin, smooth weighted round-robin, or fill-first Codex account
   selection and bounded retry/failover
 - Opt-in bounded session affinity for explicit Claude/Codex/client session
