@@ -39,6 +39,10 @@ Implemented:
 
 - `GET /v1/models`
 - `POST /v1/responses` and `/v1/responses/compact`
+- Streaming and non-streaming `POST /v1/chat/completions` translation to the Codex
+  backend, including multimodal content, function/custom tool calls, tool-name
+  shortening/restoration, structured outputs, reasoning summaries, generated images,
+  and usage accounting; legacy `POST /v1/completions` is adapted on top
 - Streaming and non-streaming `POST /v1/messages` translation for Claude Code text, images,
   tool calls/results, and basic reasoning settings
 - Local `POST /v1/messages/count_tokens` using the same O200k input-segment
@@ -60,7 +64,7 @@ criteria, subsystem status, and porting order are tracked in
 
 - The full set of Anthropic beta/content-block extensions
 - Interactive OAuth login/device authorization (existing refresh tokens are supported)
-- Chat Completions, Gemini, Anthropic, realtime, image/video, plugins, and Home
+- Gemini, Anthropic, realtime, image/video, plugins, and Home
 - Full usage accounting and the remaining CLIProxyAPI management routes
 - The complete upstream hierarchical/LCP session-affinity behavior
 

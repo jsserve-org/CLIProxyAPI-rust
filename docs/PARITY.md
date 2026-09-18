@@ -39,7 +39,7 @@ row below is complete and the full parity suite passes.
 | Listener separation | Public API-only listener; private API + management listener | Implemented extension; needs deployment tests |
 | OpenAI models | Unified and provider-aware model listing | Partial; static Codex list only |
 | Responses | HTTP streaming/non-streaming, compact, WebSocket, Codex direct aliases, Alpha Search | Partial; HTTP forwarding and compact/Alpha aliases |
-| Chat/completions | OpenAI chat completions and legacy completions | Missing |
+| Chat/completions | OpenAI chat completions and legacy completions | Partial; streaming/non-streaming request and response translation ported (multimodal, function/custom tools, name shortening, structured outputs, reasoning, images, usage); differential fixtures pending |
 | Anthropic Messages | Streaming, non-streaming, token counting, beta blocks, thinking/signatures, tool behavior | Partial; basic streaming/non-streaming translation and local Codex token counting |
 | Gemini | Models, generate/stream content, interactions and compatible actions | Missing |
 | Realtime | WebSocket, WebRTC/SIP calls, sideband control, sessions, transcription and translation | Missing |

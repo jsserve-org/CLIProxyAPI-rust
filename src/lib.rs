@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod chat;
 pub mod claude;
 pub mod config;
 pub mod error;
@@ -60,6 +61,8 @@ pub fn api_router(state: AppState) -> Router {
 fn api_routes(state: &AppState) -> Router<AppState> {
     let protected = Router::new()
         .route("/v1/models", get(proxy::models))
+        .route("/v1/chat/completions", post(chat::chat_completions))
+        .route("/v1/completions", post(chat::completions))
         .route("/v1/responses", post(proxy::responses))
         .route("/v1/responses/compact", post(proxy::responses_compact))
         .route("/v1/messages", post(claude::messages))
