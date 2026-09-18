@@ -287,7 +287,7 @@ pub fn public_entry(item: &Credential) -> Value {
     })
 }
 
-fn sanitize_name(name: &str) -> Result<&str> {
+pub(crate) fn sanitize_name(name: &str) -> Result<&str> {
     let path = Path::new(name);
     if name.is_empty()
         || path.file_name().and_then(|v| v.to_str()) != Some(name)
@@ -298,7 +298,7 @@ fn sanitize_name(name: &str) -> Result<&str> {
     Ok(name)
 }
 
-async fn write_private_json(path: &Path, value: &Value) -> Result<()> {
+pub(crate) async fn write_private_json(path: &Path, value: &Value) -> Result<()> {
     write_private_bytes(path, &serde_json::to_vec(value)?).await
 }
 

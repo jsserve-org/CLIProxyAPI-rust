@@ -80,6 +80,38 @@ pub struct Config {
     pub transient_error_cooldown_seconds: i64,
     pub quota_exceeded: QuotaExceeded,
     pub model_fallback: ModelFallback,
+    pub copilot: CopilotConfig,
+}
+
+fn default_copilot_client_id() -> String {
+    "Iv1.b507a08c87ecfe98".into()
+}
+fn default_copilot_scope() -> String {
+    "read:user".into()
+}
+fn default_copilot_upstream() -> String {
+    "https://api.githubcopilot.com".into()
+}
+
+/// GitHub Copilot provider configuration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct CopilotConfig {
+    pub enabled: bool,
+    pub client_id: String,
+    pub scope: String,
+    pub upstream_url: String,
+}
+
+impl Default for CopilotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client_id: default_copilot_client_id(),
+            scope: default_copilot_scope(),
+            upstream_url: default_copilot_upstream(),
+        }
+    }
 }
 
 /// Behavior when a quota limit is exceeded, mirroring upstream `quota-exceeded`.
@@ -142,6 +174,7 @@ impl Default for Config {
             transient_error_cooldown_seconds: 0,
             quota_exceeded: QuotaExceeded::default(),
             model_fallback: ModelFallback::default(),
+            copilot: CopilotConfig::default(),
         }
     }
 }

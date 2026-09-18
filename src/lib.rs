@@ -2,6 +2,7 @@ pub mod auth;
 pub mod chat;
 pub mod claude;
 pub mod config;
+pub mod copilot;
 pub mod error;
 pub mod management;
 pub mod proxy;
@@ -33,6 +34,7 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub routing: Arc<routing::RoutingState>,
     pub usage: Arc<usage::UsageQueue>,
+    pub copilot: Arc<copilot::CopilotStore>,
 }
 
 impl AppState {
@@ -53,6 +55,7 @@ impl AppState {
             config.usage_statistics_enabled,
             config.redis_usage_queue_retention_seconds as i64,
         ));
+        let copilot = Arc::new(copilot::CopilotStore::new(config.auth_dir.clone()).await?);
         let routing = Arc::new(routing::RoutingState::new(&config)?);
         Ok(Self {
             routing,
@@ -60,6 +63,7 @@ impl AppState {
             auth,
             client,
             usage,
+            copilot,
         })
     }
 
@@ -128,6 +132,19 @@ pub fn admin_router(state: AppState) -> Router {
                 .patch(management::put_usage_statistics_enabled),
         )
         .route("/api-key-usage", get(management::api_key_usage))
+        .route(
+            "/copilot",
+            get(management::copilot_status).delete(management::copilot_delete),
+        )
+        .route(
+            "/copilot/device-code",
+            post(management::copilot_device_code),
+        )
+        .route(
+            "/copilot/device-token",
+            post(management::copilot_device_token),
+        )
+        .route("/copilot/refresh", post(management::copilot_refresh))
         .route(
             "/debug",
             get(management::get_debug)
@@ -567,6 +584,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn management_copilot_routes() {
+        let app = admin_router(state().await);
+        let response = app
+            .clone()
+            .oneshot(admin_get("/v0/management/copilot"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await, serde_json::json!({"files": []}));
+
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "POST",
+                "/v0/management/copilot/device-code",
+                "{}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .oneshot(
+                Request::delete("/v0/management/copilot")
+                    .header("authorization", "Bearer admin-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::{AppState, auth::public_entry, error::AppError};
+use crate::{AppState, auth::public_entry, copilot, error::AppError};
 
 pub async fn config(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config();
@@ -628,6 +628,138 @@ fn string_value(body: &Value) -> Result<String, AppError> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| AppError::bad_request("invalid body"))
+}
+
+pub async fn copilot_status(State(state): State<AppState>) -> impl IntoResponse {
+    let files: Vec<Value> = state
+        .copilot
+        .list()
+        .await
+        .iter()
+        .map(|credential| copilot::public_entry(credential))
+        .collect();
+    Json(json!({"files": files}))
+}
+
+pub async fn copilot_device_code(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    if !state.config().copilot.enabled {
+        return Err(AppError::not_found("copilot is disabled"));
+    }
+    let (client_id, scope) = {
+        let config = state.config();
+        (
+            config.copilot.client_id.clone(),
+            config.copilot.scope.clone(),
+        )
+    };
+    if client_id.trim().is_empty() {
+        return Err(AppError::bad_request("copilot.client-id is empty"));
+    }
+    let device = copilot::start_device_flow(&state.client, &client_id, &scope).await?;
+    Ok(Json(json!({
+        "device_code": device.device_code,
+        "user_code": device.user_code,
+        "verification_uri": device.verification_uri,
+        "verification_uri_complete": device.verification_uri_complete,
+        "expires_in": device.expires_in,
+        "interval": device.interval,
+    })))
+}
+
+pub async fn copilot_device_token(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<impl IntoResponse, AppError> {
+    if !state.config().copilot.enabled {
+        return Err(AppError::not_found("copilot is disabled"));
+    }
+    let device_code = body
+        .get("device_code")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("device_code is required"))?;
+    let client_id = state.config().copilot.client_id.clone();
+    match copilot::poll_device_token(&state.client, &client_id, device_code).await? {
+        copilot::DevicePoll::Authorized { access_token } => {
+            let login = copilot::fetch_login(&state.client, &access_token).await;
+            let saved = state
+                .copilot
+                .save_github_token(&access_token, login.as_deref())
+                .await
+                .map_err(|error| {
+                    AppError::bad_gateway(format!("save Copilot credential: {error}"))
+                })?;
+            Ok((
+                StatusCode::OK,
+                Json(json!({"status":"ok", "name":saved.name, "login":saved.login})),
+            ))
+        }
+        copilot::DevicePoll::Pending | copilot::DevicePoll::SlowDown => {
+            Ok((StatusCode::ACCEPTED, Json(json!({"status":"pending"}))))
+        }
+        copilot::DevicePoll::Denied => Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status":"error", "error":"access_denied"})),
+        )),
+        copilot::DevicePoll::Expired => Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status":"error", "error":"expired_token"})),
+        )),
+    }
+}
+
+pub async fn copilot_refresh(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> Result<impl IntoResponse, AppError> {
+    if !state.config().copilot.enabled {
+        return Err(AppError::not_found("copilot is disabled"));
+    }
+    let auth_index = body
+        .get("auth_index")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("auth_index is required"))?;
+    let credential = state
+        .copilot
+        .find_by_index(auth_index)
+        .await
+        .ok_or_else(|| AppError::not_found("Copilot credential not found"))?;
+    state
+        .copilot
+        .ensure_copilot_token(&state.client, &credential)
+        .await?;
+    Ok(Json(json!({"status":"ok"})))
+}
+
+#[derive(Deserialize)]
+pub struct CopilotQuery {
+    auth_index: Option<String>,
+}
+
+pub async fn copilot_delete(
+    State(state): State<AppState>,
+    Query(query): Query<CopilotQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let auth_index = query
+        .auth_index
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("auth_index is required"))?;
+    if !state
+        .copilot
+        .delete(auth_index)
+        .await
+        .map_err(|error| AppError::bad_gateway(format!("delete Copilot credential: {error}")))?
+    {
+        return Err(AppError::not_found("Copilot credential not found"));
+    }
+    Ok(Json(json!({"status":"ok"})))
 }
 
 pub async fn not_implemented(request: Request) -> AppError {
