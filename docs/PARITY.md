@@ -38,7 +38,7 @@ row below is complete and the full parity suite passes.
 | Process and configuration | CLI flags, YAML schema, environment behavior, reloads, file watching, SDK configuration | Partial |
 | Listener separation | Public API-only listener; private API + management listener | Implemented extension; needs deployment tests |
 | OpenAI models | Unified and provider-aware model listing | Partial; static Codex tier registry with upstream field filtering; provider-aware listing, aliases and the Codex `client_version` catalog pending |
-| Responses | HTTP streaming/non-streaming, compact, WebSocket, Codex direct aliases, Alpha Search | Partial; HTTP forwarding, compact/Alpha aliases, and a basic WebSocket transport with multi-turn framing; incremental-input merge, prewarm, tool-call repair and upstream WebSocket passthrough pending |
+| Responses | HTTP streaming/non-streaming, compact, WebSocket, Codex direct aliases, Alpha Search | Partial; HTTP forwarding, compact/Alpha aliases, and a WebSocket transport with multi-turn framing, incremental-input transcript merge and call/item dedupe; prewarm, tool-call repair, compaction heuristics and upstream WebSocket passthrough pending |
 | Chat/completions | OpenAI chat completions and legacy completions | Partial; streaming/non-streaming request and response translation ported (multimodal, function/custom tools, name shortening, structured outputs, reasoning, images, usage); differential fixtures pending |
 | Anthropic Messages | Streaming, non-streaming, token counting, beta blocks, thinking/signatures, tool behavior | Partial; basic streaming/non-streaming translation and local Codex token counting |
 | Gemini | Models, generate/stream content, interactions and compatible actions | Missing |
