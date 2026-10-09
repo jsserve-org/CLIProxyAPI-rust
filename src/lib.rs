@@ -5,6 +5,7 @@ pub mod config;
 pub mod copilot;
 pub mod error;
 pub mod management;
+pub mod portal;
 pub mod proxy;
 pub mod registry;
 pub mod responses_websocket;
@@ -257,6 +258,8 @@ pub fn admin_router(state: AppState) -> Router {
             security::require_management_key,
         ));
     let router = api_routes(&state)
+        .route("/console", get(portal::index))
+        .route("/console/assets/{*path}", get(portal::asset))
         .nest("/v0/management", management)
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(ConcurrencyLimitLayer::new(max_concurrency));

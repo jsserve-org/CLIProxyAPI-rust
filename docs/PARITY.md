@@ -48,7 +48,7 @@ row below is complete and the full parity suite passes.
 | OAuth | Provider login flows, callbacks, sessions, refresh, cancellation, relogin | Partial; existing Codex refresh tokens and the GitHub Copilot device-code login with Copilot session-token refresh |
 | Credential routing | Round-robin/fill-first, weights, model aliases, exclusions, session affinity, cooldowns and bounded retries | Partial; three core strategies, bounded retry, bounded basic session affinity, credential/model cooldowns (quota/auth/transient with retry-after and exponential quota backoff), and weaker-model fallback; model aliases, exclusions and full hierarchical affinity pending |
 | Usage and quota | Per-key/provider accounting, usage queue, quota refresh/reset, cooldown state | Partial; in-memory usage queue (bounded retention), `/v0/management/usage-queue` draining, `usage-statistics-enabled` toggle, per-request token/metadata records, and credential/model cooldown state with `/reset-quota`; per-key aggregation and quota refresh pending |
-| Management API | Full built-in route set and exact CPAMP behavior | Partial; core auth-file/config/API-call routes plus config toggles (debug, logging, retry limits, proxy-url, routing strategy, api-keys CRUD), usage routes, quota toggles and `/reset-quota`; OAuth flows, plugins, logs, key lists for other providers, and on-disk persistence pending |
+| Management API | Full built-in route set and exact legacy client behavior | Partial; core auth-file/config/API-call routes plus config toggles (debug, logging, retry limits, proxy-url, routing strategy, api-keys CRUD), usage routes, quota toggles and `/reset-quota`; OAuth flows, plugins, logs, key lists for other providers, and on-disk persistence pending |
 | Logging | Request/error logs, rotation, lookup/download and redaction | Missing |
 | Plugins | Auth, executor, model router, management/resource routes, store lifecycle and native plugin ABI | Missing |
 | Home | Home protocol, assets, model capabilities and Home-specific management behavior | Missing |
@@ -66,7 +66,7 @@ Work proceeds in dependency order while keeping each merged slice deployable:
 1. Claude Code and Codex request/response translators, including non-streaming,
    token counting, tool/thinking semantics, session affinity and cooldowns.
 2. Exact credential routing, retry, refresh, quota and usage behavior.
-3. CPAMP's complete management and OAuth surface.
+3. The complete legacy management and OAuth surface.
 4. OpenAI chat/completions and the remaining Responses transports.
 5. Gemini and all remaining providers.
 6. Realtime, images/video, plugins, Home, logging and alternate stores.

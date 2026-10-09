@@ -7,7 +7,7 @@ Mainly for fun, since I have some usage left on my GPT subs. I decided to rewrit
 This repository is a resource-conscious Rust port of the Codex hot path from
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). It reads existing
 `type: "codex"` JSON auth files and exposes a small, deliberately bounded
-compatibility surface for Codex clients and CPA Manager Plus (CPAMP).
+compatibility surface for Codex clients and custom management applications.
 
 ## Performance at a glance
 
@@ -69,7 +69,7 @@ Implemented:
   model's credentials are all cooling or the upstream keeps failing
 - On-demand refresh of existing Codex OAuth refresh tokens after an upstream 401
 - Streaming upstream responses without buffering them in memory
-- CPAMP essentials: config validation, auth-file list/upload/download/delete,
+- Management essentials: config validation, auth-file list/upload/download/delete,
   enable/disable, reload, usage queue, and allowlisted `api-call`
 - In-memory usage accounting with bounded retention: per-request records (provider,
   executor, model/alias, endpoint, auth, client metadata, latency/TTFT, failure detail,
@@ -120,7 +120,7 @@ cargo build --release
 ./target/release/cliproxyapi-rs --config config.yaml
 ```
 
-Point CPAMP at `http://127.0.0.1:8318`; point API clients at port `8317`.
+Point your management application at `http://127.0.0.1:8318`; point API clients at port `8317`.
 
 Private multi-architecture images are published for `linux/amd64` and
 `linux/arm64` by GitHub Actions:
