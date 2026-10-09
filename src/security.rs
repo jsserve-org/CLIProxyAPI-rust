@@ -14,7 +14,7 @@ pub async fn require_api_key(
 ) -> Result<Response, AppError> {
     let supplied = bearer(request.headers()).unwrap_or_default();
     let valid = state
-        .config
+        .config()
         .api_keys
         .iter()
         .any(|key| constant_eq(key, supplied));
@@ -37,11 +37,11 @@ pub async fn require_management_key(
                 .and_then(|v| v.to_str().ok())
         })
         .unwrap_or_default();
-    let configured = &state.config.remote_management.secret_key;
+    let configured = state.config().remote_management.secret_key.clone();
     let valid = if configured.starts_with("$2") {
-        bcrypt::verify(supplied, configured).unwrap_or(false)
+        bcrypt::verify(supplied, &configured).unwrap_or(false)
     } else {
-        constant_eq(configured, supplied)
+        constant_eq(&configured, supplied)
     };
     if !valid {
         return Err(AppError::unauthorized("invalid management key"));

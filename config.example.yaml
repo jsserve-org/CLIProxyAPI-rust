@@ -27,6 +27,40 @@ usage-statistics-enabled: false
 redis-usage-queue-retention-seconds: 60
 proxy-url: ""
 
+# Credential/model cooldowns. Quota (429), auth (401/403) and transient (5xx)
+# failures park a credential so later requests skip it until it recovers.
+# disable-cooling turns this off; transient-error-cooldown-seconds overrides the
+# 60s default (negative disables transient cooldowns only).
+disable-cooling: false
+transient-error-cooldown-seconds: 0
+
+quota-exceeded:
+  switch-project: false
+  switch-preview-model: false
+
+# Auto backtracking: when a model's credentials are all cooling (quota) or the
+# upstream keeps failing, retry on the next weaker model. `default` applies when
+# no exact rule matches.
+model-fallback:
+  gpt-5.6-sol:
+    - gpt-5.6-terra
+    - gpt-5.6-luna
+  gpt-5.6-terra:
+    - gpt-5.6-luna
+  default:
+    - gpt-5.6-luna
+
+# GitHub Copilot provider. Runs the GitHub device-code flow, exchanges the
+# GitHub token for a Copilot session token, stores type:"copilot" auth files,
+# and routes the models listed below to api.githubcopilot.com. Leave `models`
+# empty to keep Copilot routing disabled.
+copilot:
+  enabled: false
+  client-id: Iv1.b507a08c87ecfe98
+  scope: read:user
+  upstream-url: https://api.githubcopilot.com
+  models: []
+
 # CPAMP's management api-call endpoint is an SSRF capability. Only these HTTPS
 # destinations are accepted. Add an exact provider hostname if CPAMP needs it.
 management-allowed-hosts:

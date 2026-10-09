@@ -37,23 +37,23 @@ row below is complete and the full parity suite passes.
 | --- | --- | --- |
 | Process and configuration | CLI flags, YAML schema, environment behavior, reloads, file watching, SDK configuration | Partial |
 | Listener separation | Public API-only listener; private API + management listener | Implemented extension; needs deployment tests |
-| OpenAI models | Unified and provider-aware model listing | Partial; static Codex list only |
-| Responses | HTTP streaming/non-streaming, compact, WebSocket, Codex direct aliases, Alpha Search | Partial; HTTP forwarding and compact/Alpha aliases |
-| Chat/completions | OpenAI chat completions and legacy completions | Missing |
+| OpenAI models | Unified and provider-aware model listing | Partial; static Codex tier registry with upstream field filtering; provider-aware listing, aliases and the Codex `client_version` catalog pending |
+| Responses | HTTP streaming/non-streaming, compact, WebSocket, Codex direct aliases, Alpha Search | Partial; HTTP forwarding, compact/Alpha aliases, and a WebSocket transport with multi-turn framing, incremental-input transcript merge, call/item dedupe and local synthetic prewarm; tool-call repair, compaction heuristics and upstream WebSocket passthrough pending |
+| Chat/completions | OpenAI chat completions and legacy completions | Partial; streaming/non-streaming request and response translation ported (multimodal, function/custom tools, name shortening, structured outputs, reasoning, images, usage); differential fixtures pending |
 | Anthropic Messages | Streaming, non-streaming, token counting, beta blocks, thinking/signatures, tool behavior | Partial; basic streaming/non-streaming translation and local Codex token counting |
 | Gemini | Models, generate/stream content, interactions and compatible actions | Missing |
 | Realtime | WebSocket, WebRTC/SIP calls, sideband control, sessions, transcription and translation | Missing |
 | Images and video | OpenAI-compatible images plus xAI/OpenAI video create/edit/extend/retrieve/content | Missing |
-| Providers | Codex, Claude, Gemini/AI Studio, Antigravity, Vertex, Kimi, xAI, OpenAI-compatible backends | Partial; Codex OAuth files only |
-| OAuth | Provider login flows, callbacks, sessions, refresh, cancellation, relogin | Partial; existing Codex refresh tokens only |
-| Credential routing | Round-robin/fill-first, weights, model aliases, exclusions, session affinity, cooldowns and bounded retries | Partial; three core strategies, bounded retry and bounded basic session affinity |
-| Usage and quota | Per-key/provider accounting, usage queue, quota refresh/reset, cooldown state | Missing; empty compatibility response only |
-| Management API | Full built-in route set and exact CPAMP behavior | Partial; core auth-file/config/API-call routes |
+| Providers | Codex, Claude, Gemini/AI Studio, Antigravity, Vertex, Kimi, xAI, OpenAI-compatible backends | Partial; Codex OAuth files plus a GitHub Copilot provider (device-code login, Copilot token exchange, and opt-in routing of configured `copilot.models` to chat/completions and responses); other non-Codex providers still need executors |
+| OAuth | Provider login flows, callbacks, sessions, refresh, cancellation, relogin | Partial; existing Codex refresh tokens and the GitHub Copilot device-code login with Copilot session-token refresh |
+| Credential routing | Round-robin/fill-first, weights, model aliases, exclusions, session affinity, cooldowns and bounded retries | Partial; three core strategies, bounded retry, bounded basic session affinity, credential/model cooldowns (quota/auth/transient with retry-after and exponential quota backoff), and weaker-model fallback; model aliases, exclusions and full hierarchical affinity pending |
+| Usage and quota | Per-key/provider accounting, usage queue, quota refresh/reset, cooldown state | Partial; in-memory usage queue (bounded retention), `/v0/management/usage-queue` draining, `usage-statistics-enabled` toggle, per-request token/metadata records, and credential/model cooldown state with `/reset-quota`; per-key aggregation and quota refresh pending |
+| Management API | Full built-in route set and exact CPAMP behavior | Partial; core auth-file/config/API-call routes plus config toggles (debug, logging, retry limits, proxy-url, routing strategy, api-keys CRUD), usage routes, quota toggles and `/reset-quota`; OAuth flows, plugins, logs, key lists for other providers, and on-disk persistence pending |
 | Logging | Request/error logs, rotation, lookup/download and redaction | Missing |
 | Plugins | Auth, executor, model router, management/resource routes, store lifecycle and native plugin ABI | Missing |
 | Home | Home protocol, assets, model capabilities and Home-specific management behavior | Missing |
 | Storage | Filesystem plus configured Git/SQL/object-store behavior | Partial; local auth directory only |
-| Model registry | Dynamic definitions, aliases, capabilities and provider availability | Missing |
+| Model registry | Dynamic definitions, aliases, capabilities and provider availability | Partial; embedded static Codex tier definitions with sorted lookup; dynamic registration, aliases, capabilities and non-Codex providers pending |
 
 At the pinned revision, the surface includes roughly 29 primary model/API
 routes and 128 built-in management route registrations. Dynamic plugin routes

@@ -69,6 +69,81 @@ pub struct Config {
     pub proxy_url: String,
     pub management_allowed_hosts: Vec<String>,
     pub routing: RoutingConfig,
+    pub debug: bool,
+    pub logging_to_file: bool,
+    pub logs_max_total_size_mb: usize,
+    pub error_logs_max_files: usize,
+    pub max_retry_credentials: usize,
+    pub max_retry_interval: u64,
+    pub force_model_prefix: bool,
+    pub disable_cooling: bool,
+    pub transient_error_cooldown_seconds: i64,
+    pub quota_exceeded: QuotaExceeded,
+    pub model_fallback: ModelFallback,
+    pub copilot: CopilotConfig,
+}
+
+fn default_copilot_client_id() -> String {
+    "Iv1.b507a08c87ecfe98".into()
+}
+fn default_copilot_scope() -> String {
+    "read:user".into()
+}
+fn default_copilot_upstream() -> String {
+    "https://api.githubcopilot.com".into()
+}
+
+/// GitHub Copilot provider configuration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct CopilotConfig {
+    pub enabled: bool,
+    pub client_id: String,
+    pub scope: String,
+    pub upstream_url: String,
+    /// Model IDs routed to the Copilot provider. Empty disables Copilot routing.
+    pub models: Vec<String>,
+}
+
+impl Default for CopilotConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client_id: default_copilot_client_id(),
+            scope: default_copilot_scope(),
+            upstream_url: default_copilot_upstream(),
+            models: Vec::new(),
+        }
+    }
+}
+
+/// Behavior when a quota limit is exceeded, mirroring upstream `quota-exceeded`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct QuotaExceeded {
+    pub switch_project: bool,
+    pub switch_preview_model: bool,
+}
+
+/// Ordered weaker-model fallback chain. `default` applies when no rule matches;
+/// a rule may also be keyed by a specific model ID.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ModelFallback {
+    #[serde(default)]
+    pub default: Vec<String>,
+    #[serde(flatten)]
+    pub rules: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl ModelFallback {
+    pub fn chain(&self, model: &str) -> Vec<String> {
+        self.rules
+            .get(model)
+            .or_else(|| self.rules.get("*"))
+            .cloned()
+            .unwrap_or_else(|| self.default.clone())
+    }
 }
 
 impl Default for Config {
@@ -91,6 +166,18 @@ impl Default for Config {
             proxy_url: String::new(),
             management_allowed_hosts: default_management_hosts(),
             routing: RoutingConfig::default(),
+            debug: false,
+            logging_to_file: false,
+            logs_max_total_size_mb: 0,
+            error_logs_max_files: 10,
+            max_retry_credentials: 0,
+            max_retry_interval: 0,
+            force_model_prefix: false,
+            disable_cooling: false,
+            transient_error_cooldown_seconds: 0,
+            quota_exceeded: QuotaExceeded::default(),
+            model_fallback: ModelFallback::default(),
+            copilot: CopilotConfig::default(),
         }
     }
 }
@@ -188,4 +275,29 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
         return Ok(PathBuf::from(home).join(text.trim_start_matches("~/")));
     }
     Ok(path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ModelFallback;
+
+    #[test]
+    fn model_fallback_chain_prefers_exact_then_wildcard_then_default() {
+        let fallback: ModelFallback =
+            serde_yaml::from_str("gpt-a:\n  - gpt-b\n\"*\":\n  - gpt-z\ndefault:\n  - gpt-d\n")
+                .unwrap();
+        assert_eq!(fallback.chain("gpt-a"), vec!["gpt-b"]);
+        assert_eq!(fallback.chain("gpt-x"), vec!["gpt-z"]);
+    }
+
+    #[test]
+    fn model_fallback_falls_back_to_default() {
+        let fallback: ModelFallback = serde_yaml::from_str("default:\n  - gpt-d\n").unwrap();
+        assert_eq!(fallback.chain("gpt-a"), vec!["gpt-d"]);
+    }
+
+    #[test]
+    fn empty_model_fallback_has_no_chain() {
+        assert!(ModelFallback::default().chain("gpt-a").is_empty());
+    }
 }

@@ -1,3 +1,6 @@
+use std::{pin::Pin, sync::Arc, time::Instant};
+
+use async_stream::stream;
 use axum::{
     body::Body,
     extract::{Path, Request, State},
@@ -5,10 +8,17 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 
-use crate::{AppState, auth::Credential, error::AppError};
+use crate::{
+    AppState, Provider,
+    auth::Credential,
+    error::AppError,
+    usage::{UsageQueue, UsageRecord},
+};
+
+const MAX_SSE_LINE: usize = 4 * 1024 * 1024;
 
 pub async fn health() -> impl IntoResponse {
     axum::Json(json!({"status": "ok"}))
@@ -23,18 +33,50 @@ pub async fn not_found() -> StatusCode {
 }
 
 pub async fn models(State(state): State<AppState>) -> impl IntoResponse {
-    let count = state
+    let available = state
         .auth
         .list()
         .await
         .iter()
         .filter(|item| !item.disabled)
-        .count();
-    axum::Json(json!({"object":"list", "data":[
-        {"id":"gpt-5.6-sol","object":"model","owned_by":"openai","available_credentials":count},
-        {"id":"gpt-5.6-terra","object":"model","owned_by":"openai","available_credentials":count},
-        {"id":"gpt-5.6-luna","object":"model","owned_by":"openai","available_credentials":count}
-    ]}))
+        .count()
+        > 0;
+    let mut data: Vec<Value> = if available {
+        crate::registry::available_models("openai")
+            .iter()
+            .map(|model| model.public_entry())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let (copilot_enabled, copilot_models) = {
+        let config = state.config();
+        (config.copilot.enabled, config.copilot.models.clone())
+    };
+    let copilot_ready = copilot_enabled
+        && state
+            .copilot
+            .list()
+            .await
+            .iter()
+            .any(|credential| !credential.disabled);
+    if copilot_ready {
+        for model in copilot_models {
+            let model = model.trim();
+            if model.is_empty() {
+                continue;
+            }
+            data.push(json!({
+                "id": model,
+                "object": "model",
+                "created": 0,
+                "owned_by": "github-copilot",
+            }));
+        }
+    }
+
+    axum::Json(json!({"object":"list", "data":data}))
 }
 
 pub async fn responses(
@@ -68,14 +110,55 @@ async fn forward(
     upstream_path: &str,
 ) -> Result<Response, AppError> {
     let (parts, body) = request.into_parts();
-    let max = state.config.max_body_bytes;
+    let max = state.config().max_body_bytes;
     let bytes = axum::body::to_bytes(body, max)
         .await
         .map_err(|_| AppError::bad_request("request body exceeds limit"))?;
     validate_json(&bytes)?;
+    if state.provider_for(&request_model(&bytes)) == Provider::Copilot {
+        if upstream_path != "responses" {
+            return Ok(StatusCode::NOT_FOUND.into_response());
+        }
+        let response = execute_copilot(&state, &parts.method, bytes, "responses").await?;
+        return to_axum(response);
+    }
     let response =
         execute_codex(&state, &parts.method, &parts.headers, bytes, upstream_path).await?;
     to_axum(response)
+}
+
+fn request_model(bytes: &[u8]) -> String {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|payload| {
+            payload
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+/// A bounded upstream response whose body stream optionally records usage.
+pub struct UpstreamResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+}
+
+impl UpstreamResponse {
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    pub fn bytes_stream(self) -> impl Stream<Item = Result<Bytes, std::io::Error>> {
+        self.body
+    }
 }
 
 pub(crate) async fn execute_codex(
@@ -84,16 +167,67 @@ pub(crate) async fn execute_codex(
     headers: &HeaderMap,
     bytes: Bytes,
     upstream_path: &str,
-) -> Result<reqwest::Response, AppError> {
+) -> Result<UpstreamResponse, AppError> {
+    let chain = model_chain(state, &bytes);
+    let total = chain.len();
+    let mut last_status = StatusCode::BAD_GATEWAY;
+    let mut last_error: Option<AppError> = None;
+    for (index, model) in chain.iter().enumerate() {
+        let body = if index == 0 {
+            bytes.clone()
+        } else {
+            rewrite_model(&bytes, model)
+        };
+        match execute_codex_model(state, method, headers, body, upstream_path, model).await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                last_status = error.status();
+                let can_fallback = index + 1 < total && should_fallback(last_status);
+                last_error = Some(error);
+                if !can_fallback {
+                    break;
+                }
+                tracing::warn!(model = %model, status = %last_status, "falling back to weaker model");
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        AppError::new(
+            last_status,
+            "all eligible credentials failed for every model",
+        )
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_codex_model(
+    state: &AppState,
+    method: &Method,
+    headers: &HeaderMap,
+    bytes: Bytes,
+    upstream_path: &str,
+    model: &str,
+) -> Result<UpstreamResponse, AppError> {
+    let started = Instant::now();
     let values = state.auth.list().await;
     let order = state.routing.candidates(&values, headers, &bytes);
     if order.credentials.is_empty() {
+        record_failure(
+            state,
+            headers,
+            &bytes,
+            upstream_path,
+            None,
+            started,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no enabled Codex credentials",
+        );
         return Err(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "no enabled Codex credentials",
         ));
     }
-    let attempts = (state.config.request_retry + 1).min(order.credentials.len());
+    let attempts = (state.config().request_retry + 1).min(order.credentials.len());
     let mut last_status = StatusCode::BAD_GATEWAY;
     for credential in order.credentials.iter().take(attempts) {
         let mut credential = credential.clone();
@@ -111,6 +245,9 @@ pub(crate) async fn execute_codex(
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(credential = %credential.name, ?error, "trying next credential after transport failure");
+                state
+                    .routing
+                    .record_result(&credential, model, false, Some(502), None);
                 state.routing.release(&order, &credential);
                 continue;
             }
@@ -132,6 +269,9 @@ pub(crate) async fn execute_codex(
                         Ok(response) => response,
                         Err(error) => {
                             tracing::warn!(credential = %credential.name, ?error, "trying next credential after refreshed-token transport failure");
+                            state
+                                .routing
+                                .record_result(&credential, model, false, Some(502), None);
                             state.routing.release(&order, &credential);
                             continue;
                         }
@@ -144,16 +284,99 @@ pub(crate) async fn execute_codex(
             }
         }
         last_status = response.status();
+        let retry_after = retry_after(&response);
         if should_retry(last_status) {
+            state.routing.record_result(
+                &credential,
+                model,
+                false,
+                Some(last_status.as_u16()),
+                retry_after,
+            );
             state.routing.release(&order, &credential);
             continue;
         }
-        return Ok(response);
+        state
+            .routing
+            .record_result(&credential, model, true, Some(last_status.as_u16()), None);
+        return Ok(wrap_response(
+            state,
+            headers,
+            &bytes,
+            upstream_path,
+            &credential,
+            started,
+            response,
+        ));
     }
+    record_failure(
+        state,
+        headers,
+        &bytes,
+        upstream_path,
+        None,
+        started,
+        last_status,
+        "all eligible credentials failed",
+    );
     Err(AppError::new(
         last_status,
         "all eligible credentials failed",
     ))
+}
+
+fn model_chain(state: &AppState, bytes: &Bytes) -> Vec<String> {
+    let requested = serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned)
+        });
+    let Some(requested) = requested else {
+        return vec![String::new()];
+    };
+    let mut chain = vec![requested.clone()];
+    for candidate in state.config().model_fallback.chain(&requested) {
+        let candidate = candidate.trim().to_owned();
+        if !candidate.is_empty() && !chain.contains(&candidate) {
+            chain.push(candidate);
+        }
+    }
+    chain
+}
+
+fn rewrite_model(bytes: &Bytes, model: &str) -> Bytes {
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("model".into(), Value::String(model.to_owned()));
+            }
+            serde_json::to_vec(&value)
+                .map(Bytes::from)
+                .unwrap_or_else(|_| bytes.clone())
+        }
+        Err(_) => bytes.clone(),
+    }
+}
+
+fn retry_after(response: &reqwest::Response) -> Option<std::time::Duration> {
+    response
+        .headers()
+        .get("retry-after")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
+}
+
+fn should_fallback(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
 }
 
 async fn send(
@@ -166,7 +389,7 @@ async fn send(
 ) -> Result<reqwest::Response, AppError> {
     let url = format!(
         "{}/{}",
-        state.config.upstream_url.trim_end_matches('/'),
+        state.config().upstream_url.trim_end_matches('/'),
         path
     );
     let mut request = state
@@ -204,6 +427,189 @@ async fn send(
     })
 }
 
+fn wrap_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+    upstream_path: &str,
+    credential: &Credential,
+    started: Instant,
+    response: reqwest::Response,
+) -> UpstreamResponse {
+    let status = response.status();
+    let response_headers = response.headers().clone();
+    let inner = response.bytes_stream();
+    if state.usage.recording() {
+        let record = build_usage_record(headers, body, upstream_path, Some(credential));
+        let recorder = UsageRecorder {
+            queue: state.usage.clone(),
+            record: Some(record),
+            started,
+            buffer: Vec::new(),
+            first_byte: false,
+        };
+        let body = Box::pin(stream! {
+            let mut inner = inner;
+            let mut recorder = recorder;
+            while let Some(chunk) = inner.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        recorder.observe(&bytes);
+                        yield Ok(bytes);
+                    }
+                    Err(error) => yield Err(std::io::Error::other(error)),
+                }
+            }
+        });
+        UpstreamResponse {
+            status,
+            headers: response_headers,
+            body,
+        }
+    } else {
+        UpstreamResponse {
+            status,
+            headers: response_headers,
+            body: Box::pin(inner.map(|result| result.map_err(std::io::Error::other))),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_failure(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+    upstream_path: &str,
+    credential: Option<&Credential>,
+    started: Instant,
+    status: StatusCode,
+    message: &str,
+) {
+    if !state.usage.recording() {
+        return;
+    }
+    let mut record = build_usage_record(headers, body, upstream_path, credential);
+    record.finish_failure(
+        started.elapsed().as_millis() as i64,
+        status.as_u16() as i64,
+        message.to_owned(),
+    );
+    if let Ok(value) = serde_json::to_value(&record) {
+        state.usage.enqueue(value);
+    }
+}
+
+fn build_usage_record(
+    headers: &HeaderMap,
+    body: &Bytes,
+    upstream_path: &str,
+    credential: Option<&Credential>,
+) -> UsageRecord {
+    let payload: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let stream = payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let reasoning_effort = payload
+        .pointer("/reasoning/effort")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("reasoning_effort").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_owned();
+    UsageRecord::new(
+        model,
+        stream,
+        reasoning_effort,
+        upstream_path.to_owned(),
+        upstream_path.to_owned(),
+        credential,
+        header_string(headers, "x-client-request-id"),
+        header_string(headers, "x-real-ip"),
+        header_string(headers, "x-forwarded-for"),
+        header_string(headers, "user-agent"),
+    )
+}
+
+fn header_string(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+struct UsageRecorder {
+    queue: Arc<UsageQueue>,
+    record: Option<UsageRecord>,
+    started: Instant,
+    buffer: Vec<u8>,
+    first_byte: bool,
+}
+
+impl UsageRecorder {
+    fn observe(&mut self, bytes: &[u8]) {
+        if !self.first_byte {
+            self.first_byte = true;
+            if let Some(record) = self.record.as_mut() {
+                record.ttft_ms = self.started.elapsed().as_millis() as i64;
+            }
+        }
+        if let Some(record) = self.record.as_mut() {
+            scan_sse_usage(bytes, &mut self.buffer, record);
+        }
+    }
+
+    fn finalize(&mut self) {
+        let Some(mut record) = self.record.take() else {
+            return;
+        };
+        record.latency_ms = self.started.elapsed().as_millis() as i64;
+        if let Ok(value) = serde_json::to_value(&record) {
+            self.queue.enqueue(value);
+        }
+    }
+}
+
+impl Drop for UsageRecorder {
+    fn drop(&mut self) {
+        self.finalize();
+    }
+}
+
+fn scan_sse_usage(chunk: &[u8], buffer: &mut Vec<u8>, record: &mut UsageRecord) {
+    if buffer.len() + chunk.len() > MAX_SSE_LINE {
+        buffer.clear();
+        return;
+    }
+    buffer.extend_from_slice(chunk);
+    while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+        let line: Vec<u8> = buffer.drain(..=position).collect();
+        let line = line.strip_suffix(b"\n").unwrap_or(&line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(data) = line.strip_prefix(b"data:") else {
+            continue;
+        };
+        let data = data.strip_prefix(b" ").unwrap_or(data);
+        if data == b"[DONE]" {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_slice::<Value>(data)
+            && matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("response.completed") | Some("response.incomplete")
+            )
+        {
+            record.apply_completed_event(&event);
+        }
+    }
+}
+
 fn validate_json(bytes: &[u8]) -> Result<(), AppError> {
     let payload: Value =
         serde_json::from_slice(bytes).map_err(|_| AppError::bad_request("invalid JSON body"))?;
@@ -220,12 +626,132 @@ fn should_retry(status: StatusCode) -> bool {
     )
 }
 
-fn to_axum(upstream: reqwest::Response) -> Result<Response, AppError> {
+pub(crate) async fn execute_copilot(
+    state: &AppState,
+    method: &Method,
+    body: Bytes,
+    upstream_path: &str,
+) -> Result<UpstreamResponse, AppError> {
+    let credentials = state.copilot.list().await;
+    let enabled: Vec<_> = credentials
+        .iter()
+        .filter(|credential| !credential.disabled)
+        .cloned()
+        .collect();
+    if enabled.is_empty() {
+        return Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no enabled Copilot credentials",
+        ));
+    }
+    let base = state
+        .config()
+        .copilot
+        .upstream_url
+        .trim_end_matches('/')
+        .to_owned();
+    let retry_limit = state.config().request_retry;
+    let attempts = (retry_limit + 1).min(enabled.len());
+    let mut last_status = StatusCode::BAD_GATEWAY;
+    for credential in enabled.iter().take(attempts) {
+        let token = match state
+            .copilot
+            .ensure_copilot_token(&state.client, credential)
+            .await
+        {
+            Ok(token) => token,
+            Err(error) => {
+                last_status = error.status();
+                tracing::warn!(credential = %credential.name, %error, "Copilot token unavailable");
+                continue;
+            }
+        };
+        let mut response =
+            match copilot_send(state, &base, method, &body, upstream_path, &token).await {
+                Ok(response) => response,
+                Err(error) => {
+                    last_status = error.status();
+                    continue;
+                }
+            };
+        if response.status() == StatusCode::UNAUTHORIZED {
+            match state
+                .copilot
+                .force_refresh_copilot_token(&state.client, credential)
+                .await
+            {
+                Ok(token) => {
+                    match copilot_send(state, &base, method, &body, upstream_path, &token).await {
+                        Ok(retried) => response = retried,
+                        Err(error) => {
+                            last_status = error.status();
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(credential = %credential.name, %error, "Copilot token refresh failed")
+                }
+            }
+        }
+        last_status = response.status();
+        if should_retry(last_status) {
+            continue;
+        }
+        return Ok(passthrough_response(response));
+    }
+    Err(AppError::new(
+        last_status,
+        "all eligible Copilot credentials failed",
+    ))
+}
+
+async fn copilot_send(
+    state: &AppState,
+    base: &str,
+    method: &Method,
+    body: &Bytes,
+    upstream_path: &str,
+    token: &str,
+) -> Result<reqwest::Response, AppError> {
+    let url = format!("{base}/{upstream_path}");
+    state
+        .client
+        .request(method.clone(), url)
+        .header("accept", "text/event-stream")
+        .header("content-type", "application/json")
+        .header("user-agent", "GitHubCopilotChat/0.26.7")
+        .header("editor-version", "vscode/1.99.0")
+        .header("editor-plugin-version", "copilot-chat/0.26.7")
+        .header("copilot-integration-id", "vscode-chat")
+        .header("authorization", format!("Bearer {token}"))
+        .body(body.clone())
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "Copilot request failed");
+            AppError::bad_gateway("Copilot request failed")
+        })
+}
+
+fn passthrough_response(response: reqwest::Response) -> UpstreamResponse {
+    let status = response.status();
+    let headers = response.headers().clone();
+    UpstreamResponse {
+        status,
+        headers,
+        body: Box::pin(
+            response
+                .bytes_stream()
+                .map(|result| result.map_err(std::io::Error::other)),
+        ),
+    }
+}
+
+pub(crate) fn to_axum(upstream: UpstreamResponse) -> Result<Response, AppError> {
     let status = upstream.status();
     let headers = upstream.headers().clone();
-    let stream = upstream
-        .bytes_stream()
-        .map(|result| result.map_err(std::io::Error::other));
+    let stream = upstream.bytes_stream();
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     for name in [
@@ -242,4 +768,37 @@ fn to_axum(upstream: reqwest::Response) -> Result<Response, AppError> {
         }
     }
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+    use bytes::Bytes;
+
+    use super::{rewrite_model, should_fallback};
+
+    #[test]
+    fn rewrite_model_replaces_top_level_model() {
+        let body = Bytes::from_static(br#"{"model":"a","stream":true}"#);
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&rewrite_model(&body, "b")).unwrap();
+        assert_eq!(rewritten["model"], serde_json::json!("b"));
+        assert_eq!(rewritten["stream"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn rewrite_model_leaves_non_json_unchanged() {
+        let body = Bytes::from_static(b"not json");
+        assert_eq!(rewrite_model(&body, "b"), body);
+    }
+
+    #[test]
+    fn fallback_covers_quota_cooldown_and_transient_statuses() {
+        assert!(should_fallback(StatusCode::TOO_MANY_REQUESTS));
+        assert!(should_fallback(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(should_fallback(StatusCode::BAD_GATEWAY));
+        assert!(should_fallback(StatusCode::REQUEST_TIMEOUT));
+        assert!(!should_fallback(StatusCode::BAD_REQUEST));
+        assert!(!should_fallback(StatusCode::UNAUTHORIZED));
+    }
 }
