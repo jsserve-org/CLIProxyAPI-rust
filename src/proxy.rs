@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::{pin::Pin, sync::Arc, time::Instant};
 
 use async_stream::stream;
@@ -210,8 +211,13 @@ async fn execute_codex_model(
 ) -> Result<UpstreamResponse, AppError> {
     let started = Instant::now();
     let values = state.auth.list().await;
-    let order = state.routing.candidates(&values, headers, &bytes);
-    if order.credentials.is_empty() {
+    if state
+        .routing
+        .candidates(&values, headers, &bytes)
+        .credentials
+        .is_empty()
+        && state.routing.cooldown_wait(&values, model).is_none()
+    {
         record_failure(
             state,
             headers,
@@ -227,87 +233,130 @@ async fn execute_codex_model(
             "no enabled Codex credentials",
         ));
     }
-    let attempts = (state.config().request_retry + 1).min(order.credentials.len());
     let mut last_status = StatusCode::BAD_GATEWAY;
-    for credential in order.credentials.iter().take(attempts) {
-        let mut credential = credential.clone();
-        state.routing.bind(&order, &credential);
-        let mut response = match send(
-            state,
-            method,
-            headers,
-            bytes.clone(),
-            upstream_path,
-            &credential,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!(credential = %credential.name, ?error, "trying next credential after transport failure");
-                state
-                    .routing
-                    .record_result(&credential, model, false, Some(502), None);
-                state.routing.release(&order, &credential);
+    let retry_rounds = state.config().request_retry.saturating_add(1);
+    let max_credentials = state.config().max_retry_credentials;
+    let max_interval = state.config().max_retry_interval;
+    for round in 0..retry_rounds {
+        let order = state.routing.candidates(&values, headers, &bytes);
+        let mut attempted = HashSet::new();
+        let mut round_attempts = 0usize;
+        for candidate in &order.credentials {
+            if attempted.contains(&candidate.auth_index)
+                || candidate
+                    .request_retry_override()
+                    .is_some_and(|limit| round > limit)
+                || (max_credentials > 0 && round_attempts >= max_credentials)
+            {
                 continue;
             }
-        };
-        if response.status() == StatusCode::UNAUTHORIZED {
-            match state.auth.refresh(&state.client, &credential).await {
-                Ok(Some(refreshed)) => {
-                    credential = refreshed;
-                    response = match send(
-                        state,
-                        method,
-                        headers,
-                        bytes.clone(),
-                        upstream_path,
-                        &credential,
-                    )
-                    .await
-                    {
-                        Ok(response) => response,
-                        Err(error) => {
-                            tracing::warn!(credential = %credential.name, ?error, "trying next credential after refreshed-token transport failure");
-                            state
-                                .routing
-                                .record_result(&credential, model, false, Some(502), None);
-                            state.routing.release(&order, &credential);
-                            continue;
-                        }
-                    };
-                }
-                Ok(None) => {}
+            attempted.insert(candidate.auth_index.clone());
+            round_attempts += 1;
+            let mut credential = candidate.clone();
+            state.routing.bind(&order, &credential);
+            let mut response = match send(
+                state,
+                method,
+                headers,
+                bytes.clone(),
+                upstream_path,
+                &credential,
+            )
+            .await
+            {
+                Ok(response) => response,
                 Err(error) => {
-                    tracing::warn!(credential = %credential.name, %error, "token refresh failed")
+                    tracing::warn!(credential = %credential.name, ?error, "trying next credential after transport failure");
+                    state
+                        .routing
+                        .record_result(&credential, model, false, Some(502), None);
+                    state.routing.release(&order, &credential);
+                    continue;
+                }
+            };
+            if response.status() == StatusCode::UNAUTHORIZED {
+                match state.auth.refresh(&state.client, &credential).await {
+                    Ok(Some(refreshed)) => {
+                        credential = refreshed;
+                        response = match send(
+                            state,
+                            method,
+                            headers,
+                            bytes.clone(),
+                            upstream_path,
+                            &credential,
+                        )
+                        .await
+                        {
+                            Ok(response) => response,
+                            Err(error) => {
+                                tracing::warn!(credential = %credential.name, ?error, "trying next credential after refreshed-token transport failure");
+                                state.routing.record_result(
+                                    &credential,
+                                    model,
+                                    false,
+                                    Some(502),
+                                    None,
+                                );
+                                state.routing.release(&order, &credential);
+                                continue;
+                            }
+                        };
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(credential = %credential.name, %error, "token refresh failed")
+                    }
                 }
             }
-        }
-        last_status = response.status();
-        let retry_after = retry_after(&response);
-        if should_retry(last_status) {
-            state.routing.record_result(
+            last_status = response.status();
+            let retry_after = retry_after(&response);
+            if should_retry(last_status) {
+                state.routing.record_result(
+                    &credential,
+                    model,
+                    false,
+                    Some(last_status.as_u16()),
+                    retry_after,
+                );
+                state.routing.release(&order, &credential);
+                if let Some(retry_after) = retry_after {
+                    let wait = if max_interval == 0 {
+                        std::time::Duration::ZERO
+                    } else {
+                        retry_after.min(std::time::Duration::from_secs(max_interval))
+                    };
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+                continue;
+            }
+            state
+                .routing
+                .record_result(&credential, model, true, Some(last_status.as_u16()), None);
+            return Ok(wrap_response(
+                state,
+                headers,
+                &bytes,
+                upstream_path,
                 &credential,
-                model,
-                false,
-                Some(last_status.as_u16()),
-                retry_after,
-            );
-            state.routing.release(&order, &credential);
-            continue;
+                started,
+                response,
+            ));
         }
-        state
-            .routing
-            .record_result(&credential, model, true, Some(last_status.as_u16()), None);
-        return Ok(wrap_response(
-            state,
-            headers,
-            &bytes,
-            upstream_path,
-            &credential,
-            started,
-            response,
-        ));
+        if round + 1 < retry_rounds
+            && let Some(wait) = state.routing.cooldown_wait(&values, model)
+        {
+            let wait = if max_interval == 0 {
+                std::time::Duration::ZERO
+            } else {
+                wait.min(std::time::Duration::from_secs(max_interval))
+            };
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+        }
     }
     record_failure(
         state,

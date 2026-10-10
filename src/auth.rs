@@ -26,6 +26,33 @@ pub struct Credential {
     pub raw: Map<String, Value>,
 }
 
+impl Credential {
+    /// Return the upstream-compatible per-auth retry override. Both the
+    /// canonical underscore spelling and the legacy hyphen spelling are
+    /// accepted, including values nested under `metadata`.
+    pub fn request_retry_override(&self) -> Option<usize> {
+        let value = self
+            .raw
+            .get("request_retry")
+            .or_else(|| self.raw.get("request-retry"))
+            .or_else(|| {
+                self.raw.get("metadata").and_then(|metadata| {
+                    metadata
+                        .get("request_retry")
+                        .or_else(|| metadata.get("request-retry"))
+                })
+            })?;
+        match value {
+            Value::Number(number) => number
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .map(|value| value as usize),
+            Value::String(text) => text.trim().parse::<usize>().ok(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AuthStore {
     auth_dir: PathBuf,
@@ -321,11 +348,46 @@ async fn write_private_bytes(path: &Path, data: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_name;
+    use serde_json::json;
+
+    use super::{Credential, sanitize_name};
     #[test]
     fn rejects_path_traversal() {
         assert!(sanitize_name("../secret.json").is_err());
         assert!(sanitize_name("token.txt").is_err());
         assert!(sanitize_name("codex.json").is_ok());
+    }
+
+    #[test]
+    fn request_retry_override_accepts_canonical_legacy_and_metadata_forms() {
+        let credential = |raw| Credential {
+            name: "auth.json".into(),
+            path: "/tmp/auth.json".into(),
+            auth_index: "auth".into(),
+            access_token: "token".into(),
+            account_id: None,
+            disabled: false,
+            raw,
+        };
+        assert_eq!(
+            credential(serde_json::from_value(json!({"request_retry": 2})).unwrap())
+                .request_retry_override(),
+            Some(2)
+        );
+        assert_eq!(
+            credential(serde_json::from_value(json!({"request-retry": "3"})).unwrap())
+                .request_retry_override(),
+            Some(3)
+        );
+        assert_eq!(
+            credential(serde_json::from_value(json!({"metadata": {"request_retry": 4}})).unwrap())
+                .request_retry_override(),
+            Some(4)
+        );
+        assert_eq!(
+            credential(serde_json::from_value(json!({"request_retry": -1})).unwrap())
+                .request_retry_override(),
+            None
+        );
     }
 }
