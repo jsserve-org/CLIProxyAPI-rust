@@ -86,15 +86,22 @@ Implemented:
   `copilot.models` through `api.githubcopilot.com` (chat/completions, responses,
   and `/v1/models`)
 - Existing CLIProxyAPI Codex auth-file shape and plaintext or bcrypt management keys
+- Gemini-compatible forwarding: configure `gemini-api-key` and
+  `interactions-api-key` entries for `/v1beta/models`, Gemini model actions
+  such as `generateContent`/`streamGenerateContent`, and `/v1beta/interactions`.
 
 Not yet a one-to-one replacement. The pinned upstream revision, completion
 criteria, subsystem status, and porting order are tracked in
 [`docs/PARITY.md`](docs/PARITY.md):
 
 - The full set of Anthropic beta/content-block extensions
-- Interactive OAuth login/device authorization (existing refresh tokens are supported)
-- Gemini, Anthropic, realtime, image/video, plugins, and Home
-- The remaining CLIProxyAPI management routes (key lists for other providers, logs, OAuth flows)
+- Provider OAuth login is available through `/v0/management/codex-auth-url` and
+  `/v0/management/anthropic-auth-url`, with PKCE callbacks at
+  `/v0/management/oauth-callback`; pending sessions can be inspected or cancelled
+  through `/get-auth-status` and `DELETE /oauth-session`.
+- Anthropic, realtime, image/video, plugins, and Home; Gemini provider-native
+  translation and advanced model/key routing remain pending
+- The remaining CLIProxyAPI management routes (key lists for other providers and logs)
 - The complete upstream hierarchical/LCP session-affinity behavior
 
 Unknown management paths return `501 Not Implemented`. Public unknown paths

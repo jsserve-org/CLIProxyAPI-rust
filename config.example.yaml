@@ -23,6 +23,13 @@ routing:
   session-affinity-ttl: 1h
   session-affinity-subagents: true
 upstream-url: https://chatgpt.com/backend-api/codex
+# Gemini-compatible API credentials. These are forwarded to /v1beta routes.
+# gemini-api-key:
+#   - api-key: replace-with-gemini-key
+#     base-url: https://generativelanguage.googleapis.com
+# interactions-api-key:
+#   - api-key: replace-with-gemini-interactions-key
+gemini-upstream-url: https://generativelanguage.googleapis.com
 usage-statistics-enabled: false
 redis-usage-queue-retention-seconds: 60
 proxy-url: ""

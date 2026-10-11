@@ -4,7 +4,9 @@ pub mod claude;
 pub mod config;
 pub mod copilot;
 pub mod error;
+pub mod gemini;
 pub mod management;
+pub mod oauth;
 pub mod portal;
 pub mod proxy;
 pub mod registry;
@@ -36,6 +38,7 @@ pub struct AppState {
     pub routing: Arc<routing::RoutingState>,
     pub usage: Arc<usage::UsageQueue>,
     pub copilot: Arc<copilot::CopilotStore>,
+    pub oauth: oauth::OAuthSessions,
 }
 
 impl AppState {
@@ -65,6 +68,7 @@ impl AppState {
             client,
             usage,
             copilot,
+            oauth: oauth::OAuthSessions::default(),
         })
     }
 
@@ -116,6 +120,9 @@ fn api_routes(state: &AppState) -> Router<AppState> {
         .route("/v1/responses/compact", post(proxy::responses_compact))
         .route("/v1/messages", post(claude::messages))
         .route("/v1/messages/count_tokens", post(claude::count_tokens))
+        .route("/v1beta/models", get(gemini::models))
+        .route("/v1beta/interactions", post(gemini::interactions))
+        .route("/v1beta/models/{*action}", any(gemini::action))
         .route(
             "/backend-api/codex/responses",
             get(responses_websocket::responses_websocket),
@@ -149,6 +156,17 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/auth-files/download", get(management::download))
         .route("/auth-files/status", patch(management::patch_status))
         .route("/auth-files/refresh", post(management::refresh))
+        .route("/anthropic-auth-url", get(management::anthropic_auth_url))
+        .route("/codex-auth-url", get(management::codex_auth_url))
+        .route("/get-auth-status", get(management::get_auth_status))
+        .route(
+            "/oauth-session",
+            axum::routing::delete(management::delete_oauth_session),
+        )
+        .route(
+            "/oauth-callback",
+            get(management::oauth_callback_get).post(management::oauth_callback_post),
+        )
         .route("/api-call", post(management::api_call))
         .route("/usage-queue", get(management::usage_queue))
         .route(

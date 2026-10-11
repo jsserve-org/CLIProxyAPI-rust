@@ -37,6 +37,9 @@ fn default_retry() -> usize {
 fn default_upstream() -> String {
     "https://chatgpt.com/backend-api/codex".into()
 }
+fn default_gemini_upstream() -> String {
+    "https://generativelanguage.googleapis.com".into()
+}
 fn default_management_hosts() -> Vec<String> {
     [
         "chatgpt.com",
@@ -64,6 +67,9 @@ pub struct Config {
     pub upstream_timeout_seconds: u64,
     pub request_retry: usize,
     pub upstream_url: String,
+    pub gemini_api_key: Vec<GeminiKey>,
+    pub interactions_api_key: Vec<GeminiKey>,
+    pub gemini_upstream_url: String,
     pub usage_statistics_enabled: bool,
     pub redis_usage_queue_retention_seconds: usize,
     pub proxy_url: String,
@@ -161,6 +167,9 @@ impl Default for Config {
             upstream_timeout_seconds: default_timeout(),
             request_retry: default_retry(),
             upstream_url: default_upstream(),
+            gemini_api_key: Vec::new(),
+            interactions_api_key: Vec::new(),
+            gemini_upstream_url: default_gemini_upstream(),
             usage_statistics_enabled: false,
             redis_usage_queue_retention_seconds: 60,
             proxy_url: String::new(),
@@ -180,6 +189,15 @@ impl Default for Config {
             copilot: CopilotConfig::default(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct GeminiKey {
+    pub api_key: String,
+    pub base_url: String,
+    pub disabled: bool,
+    pub request_retry: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -253,6 +271,24 @@ impl Config {
         let parsed = url::Url::parse(&self.upstream_url).context("invalid upstream-url")?;
         if parsed.scheme() != "https" {
             bail!("upstream-url must use HTTPS");
+        }
+        let gemini =
+            url::Url::parse(&self.gemini_upstream_url).context("invalid gemini-upstream-url")?;
+        if gemini.scheme() != "https" {
+            bail!("gemini-upstream-url must use HTTPS");
+        }
+        for key in self
+            .gemini_api_key
+            .iter()
+            .chain(self.interactions_api_key.iter())
+        {
+            if !key.base_url.trim().is_empty()
+                && url::Url::parse(&key.base_url)
+                    .ok()
+                    .is_none_or(|url| url.scheme() != "https")
+            {
+                bail!("Gemini credential base-url must use HTTPS");
+            }
         }
         Ok(())
     }

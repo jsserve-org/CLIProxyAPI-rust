@@ -26,6 +26,33 @@ pub struct Credential {
     pub raw: Map<String, Value>,
 }
 
+impl Credential {
+    /// Return the upstream-compatible per-auth retry override. Both the
+    /// canonical underscore spelling and the legacy hyphen spelling are
+    /// accepted, including values nested under `metadata`.
+    pub fn request_retry_override(&self) -> Option<usize> {
+        let value = self
+            .raw
+            .get("request_retry")
+            .or_else(|| self.raw.get("request-retry"))
+            .or_else(|| {
+                self.raw.get("metadata").and_then(|metadata| {
+                    metadata
+                        .get("request_retry")
+                        .or_else(|| metadata.get("request-retry"))
+                })
+            })?;
+        match value {
+            Value::Number(number) => number
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .map(|value| value as usize),
+            Value::String(text) => text.trim().parse::<usize>().ok(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AuthStore {
     auth_dir: PathBuf,
@@ -64,7 +91,9 @@ impl AuthStore {
             }
             match load_one(&path).await {
                 Ok(Some(credential)) => loaded.push(Arc::new(credential)),
-                Ok(None) => tracing::debug!(path = %path.display(), "ignored non-Codex auth file"),
+                Ok(None) => {
+                    tracing::debug!(path = %path.display(), "ignored unsupported auth file")
+                }
                 Err(error) => {
                     tracing::warn!(path = %path.display(), %error, "ignored invalid auth file")
                 }
@@ -81,7 +110,11 @@ impl AuthStore {
 
     pub async fn candidates(&self) -> Vec<Arc<Credential>> {
         let values = self.list().await;
-        let enabled: Vec<_> = values.iter().filter(|v| !v.disabled).cloned().collect();
+        let enabled: Vec<_> = values
+            .iter()
+            .filter(|v| !v.disabled && v.raw.get("type").and_then(Value::as_str) == Some("codex"))
+            .cloned()
+            .collect();
         if enabled.is_empty() {
             return enabled;
         }
@@ -159,6 +192,9 @@ impl AuthStore {
         client: &reqwest::Client,
         stale: &Credential,
     ) -> Result<Option<Arc<Credential>>> {
+        if stale.raw.get("type").and_then(Value::as_str) != Some("codex") {
+            return Ok(None);
+        }
         let _guard = self.refresh_lock.lock().await;
         // Another request may already have refreshed and replaced the stale token.
         if let Some(current) = self.find(&stale.name, Some(&stale.auth_index)).await
@@ -237,7 +273,8 @@ fn unix_seconds() -> u64 {
 async fn load_one(path: &Path) -> Result<Option<Credential>> {
     let bytes = tokio::fs::read(path).await?;
     let raw: Map<String, Value> = serde_json::from_slice(&bytes)?;
-    if raw.get("type").and_then(Value::as_str) != Some("codex") {
+    let provider = raw.get("type").and_then(Value::as_str).unwrap_or_default();
+    if !matches!(provider, "codex" | "claude" | "anthropic") {
         return Ok(None);
     }
     let Some(access_token) = raw
@@ -253,8 +290,8 @@ async fn load_one(path: &Path) -> Result<Option<Credential>> {
         .context("invalid filename")?
         .to_owned();
     let mut digest = Sha256::new();
-    // Matches CLIProxyAPI's stableAuthIndex("codex:<absolute auth path>").
-    digest.update(format!("codex:{}", path.display()).as_bytes());
+    // Matches CLIProxyAPI's stableAuthIndex("<provider>:<absolute auth path>").
+    digest.update(format!("{provider}:{}", path.display()).as_bytes());
     let auth_index = hex::encode(&digest.finalize()[..8]);
     Ok(Some(Credential {
         name,
@@ -278,8 +315,8 @@ pub fn public_entry(item: &Credential) -> Value {
         "id": item.name,
         "name": item.name,
         "auth_index": item.auth_index,
-        "type": "codex",
-        "provider": "codex",
+        "type": item.raw.get("type").and_then(Value::as_str).unwrap_or("codex"),
+        "provider": item.raw.get("type").and_then(Value::as_str).unwrap_or("codex"),
         "email": item.raw.get("email").cloned().unwrap_or(Value::String(String::new())),
         "account_id": item.account_id,
         "disabled": item.disabled,
@@ -321,11 +358,46 @@ async fn write_private_bytes(path: &Path, data: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_name;
+    use serde_json::json;
+
+    use super::{Credential, sanitize_name};
     #[test]
     fn rejects_path_traversal() {
         assert!(sanitize_name("../secret.json").is_err());
         assert!(sanitize_name("token.txt").is_err());
         assert!(sanitize_name("codex.json").is_ok());
+    }
+
+    #[test]
+    fn request_retry_override_accepts_canonical_legacy_and_metadata_forms() {
+        let credential = |raw| Credential {
+            name: "auth.json".into(),
+            path: "/tmp/auth.json".into(),
+            auth_index: "auth".into(),
+            access_token: "token".into(),
+            account_id: None,
+            disabled: false,
+            raw,
+        };
+        assert_eq!(
+            credential(serde_json::from_value(json!({"request_retry": 2})).unwrap())
+                .request_retry_override(),
+            Some(2)
+        );
+        assert_eq!(
+            credential(serde_json::from_value(json!({"request-retry": "3"})).unwrap())
+                .request_retry_override(),
+            Some(3)
+        );
+        assert_eq!(
+            credential(serde_json::from_value(json!({"metadata": {"request_retry": 4}})).unwrap())
+                .request_retry_override(),
+            Some(4)
+        );
+        assert_eq!(
+            credential(serde_json::from_value(json!({"request_retry": -1})).unwrap())
+                .request_retry_override(),
+            None
+        );
     }
 }

@@ -220,6 +220,42 @@ impl RoutingState {
         }
     }
 
+    /// Return the shortest remaining cooldown for an enabled credential/model.
+    /// This lets the retry conductor wait for a cooled credential between
+    /// rounds instead of immediately reporting that no credential exists.
+    pub fn cooldown_wait(
+        &self,
+        values: &[std::sync::Arc<Credential>],
+        model: &str,
+    ) -> Option<Duration> {
+        if self.disable_cooling {
+            return None;
+        }
+        let now = Instant::now();
+        let cooldowns = self
+            .cooldowns
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        values
+            .iter()
+            .filter(|credential| !credential.disabled)
+            .filter_map(|credential| {
+                let mut wait = None;
+                for scope in [model, AUTH_SCOPE] {
+                    if let Some(entry) = cooldowns.get(&cooldown_key(&credential.auth_index, scope))
+                        && entry.until > now
+                    {
+                        let remaining = entry.until.saturating_duration_since(now);
+                        wait = Some(
+                            wait.map_or(remaining, |current: Duration| current.min(remaining)),
+                        );
+                    }
+                }
+                wait
+            })
+            .min()
+    }
+
     pub fn bind(&self, order: &CandidateOrder, credential: &Credential) {
         let Some(key) = &order.cache_key else { return };
         let mut sessions = self
@@ -693,6 +729,30 @@ mod tests {
             .unwrap();
         let remaining = entry.until.saturating_duration_since(Instant::now());
         assert!(remaining >= Duration::from_secs(9));
+    }
+
+    #[test]
+    fn cooldown_wait_reports_earliest_enabled_credential() {
+        let config = Config::default();
+        let routing = RoutingState::new(&config).unwrap();
+        let credentials = vec![credential("one"), credential("two")];
+        routing.record_result(
+            &credentials[0],
+            "gpt-test",
+            false,
+            Some(429),
+            Some(Duration::from_secs(20)),
+        );
+        routing.record_result(
+            &credentials[1],
+            "gpt-test",
+            false,
+            Some(429),
+            Some(Duration::from_secs(2)),
+        );
+        let wait = routing.cooldown_wait(&credentials, "gpt-test").unwrap();
+        assert!(wait >= Duration::from_secs(9));
+        assert!(wait < Duration::from_secs(20));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::{pin::Pin, sync::Arc, time::Instant};
 
 use async_stream::stream;
@@ -38,7 +39,9 @@ pub async fn models(State(state): State<AppState>) -> impl IntoResponse {
         .list()
         .await
         .iter()
-        .filter(|item| !item.disabled)
+        .filter(|item| {
+            !item.disabled && item.raw.get("type").and_then(Value::as_str) == Some("codex")
+        })
         .count()
         > 0;
     let mut data: Vec<Value> = if available {
@@ -209,9 +212,21 @@ async fn execute_codex_model(
     model: &str,
 ) -> Result<UpstreamResponse, AppError> {
     let started = Instant::now();
-    let values = state.auth.list().await;
-    let order = state.routing.candidates(&values, headers, &bytes);
-    if order.credentials.is_empty() {
+    let values: Vec<_> = state
+        .auth
+        .list()
+        .await
+        .iter()
+        .filter(|item| item.raw.get("type").and_then(Value::as_str) == Some("codex"))
+        .cloned()
+        .collect();
+    if state
+        .routing
+        .candidates(&values, headers, &bytes)
+        .credentials
+        .is_empty()
+        && state.routing.cooldown_wait(&values, model).is_none()
+    {
         record_failure(
             state,
             headers,
@@ -227,87 +242,130 @@ async fn execute_codex_model(
             "no enabled Codex credentials",
         ));
     }
-    let attempts = (state.config().request_retry + 1).min(order.credentials.len());
     let mut last_status = StatusCode::BAD_GATEWAY;
-    for credential in order.credentials.iter().take(attempts) {
-        let mut credential = credential.clone();
-        state.routing.bind(&order, &credential);
-        let mut response = match send(
-            state,
-            method,
-            headers,
-            bytes.clone(),
-            upstream_path,
-            &credential,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!(credential = %credential.name, ?error, "trying next credential after transport failure");
-                state
-                    .routing
-                    .record_result(&credential, model, false, Some(502), None);
-                state.routing.release(&order, &credential);
+    let retry_rounds = state.config().request_retry.saturating_add(1);
+    let max_credentials = state.config().max_retry_credentials;
+    let max_interval = state.config().max_retry_interval;
+    for round in 0..retry_rounds {
+        let order = state.routing.candidates(&values, headers, &bytes);
+        let mut attempted = HashSet::new();
+        let mut round_attempts = 0usize;
+        for candidate in &order.credentials {
+            if attempted.contains(&candidate.auth_index)
+                || candidate
+                    .request_retry_override()
+                    .is_some_and(|limit| round > limit)
+                || (max_credentials > 0 && round_attempts >= max_credentials)
+            {
                 continue;
             }
-        };
-        if response.status() == StatusCode::UNAUTHORIZED {
-            match state.auth.refresh(&state.client, &credential).await {
-                Ok(Some(refreshed)) => {
-                    credential = refreshed;
-                    response = match send(
-                        state,
-                        method,
-                        headers,
-                        bytes.clone(),
-                        upstream_path,
-                        &credential,
-                    )
-                    .await
-                    {
-                        Ok(response) => response,
-                        Err(error) => {
-                            tracing::warn!(credential = %credential.name, ?error, "trying next credential after refreshed-token transport failure");
-                            state
-                                .routing
-                                .record_result(&credential, model, false, Some(502), None);
-                            state.routing.release(&order, &credential);
-                            continue;
-                        }
-                    };
-                }
-                Ok(None) => {}
+            attempted.insert(candidate.auth_index.clone());
+            round_attempts += 1;
+            let mut credential = candidate.clone();
+            state.routing.bind(&order, &credential);
+            let mut response = match send(
+                state,
+                method,
+                headers,
+                bytes.clone(),
+                upstream_path,
+                &credential,
+            )
+            .await
+            {
+                Ok(response) => response,
                 Err(error) => {
-                    tracing::warn!(credential = %credential.name, %error, "token refresh failed")
+                    tracing::warn!(credential = %credential.name, ?error, "trying next credential after transport failure");
+                    state
+                        .routing
+                        .record_result(&credential, model, false, Some(502), None);
+                    state.routing.release(&order, &credential);
+                    continue;
+                }
+            };
+            if response.status() == StatusCode::UNAUTHORIZED {
+                match state.auth.refresh(&state.client, &credential).await {
+                    Ok(Some(refreshed)) => {
+                        credential = refreshed;
+                        response = match send(
+                            state,
+                            method,
+                            headers,
+                            bytes.clone(),
+                            upstream_path,
+                            &credential,
+                        )
+                        .await
+                        {
+                            Ok(response) => response,
+                            Err(error) => {
+                                tracing::warn!(credential = %credential.name, ?error, "trying next credential after refreshed-token transport failure");
+                                state.routing.record_result(
+                                    &credential,
+                                    model,
+                                    false,
+                                    Some(502),
+                                    None,
+                                );
+                                state.routing.release(&order, &credential);
+                                continue;
+                            }
+                        };
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(credential = %credential.name, %error, "token refresh failed")
+                    }
                 }
             }
-        }
-        last_status = response.status();
-        let retry_after = retry_after(&response);
-        if should_retry(last_status) {
-            state.routing.record_result(
+            last_status = response.status();
+            let retry_after = retry_after(&response);
+            if should_retry(last_status) {
+                state.routing.record_result(
+                    &credential,
+                    model,
+                    false,
+                    Some(last_status.as_u16()),
+                    retry_after,
+                );
+                state.routing.release(&order, &credential);
+                if let Some(retry_after) = retry_after {
+                    let wait = if max_interval == 0 {
+                        std::time::Duration::ZERO
+                    } else {
+                        retry_after.min(std::time::Duration::from_secs(max_interval))
+                    };
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+                continue;
+            }
+            state
+                .routing
+                .record_result(&credential, model, true, Some(last_status.as_u16()), None);
+            return Ok(wrap_response(
+                state,
+                headers,
+                &bytes,
+                upstream_path,
                 &credential,
-                model,
-                false,
-                Some(last_status.as_u16()),
-                retry_after,
-            );
-            state.routing.release(&order, &credential);
-            continue;
+                started,
+                response,
+            ));
         }
-        state
-            .routing
-            .record_result(&credential, model, true, Some(last_status.as_u16()), None);
-        return Ok(wrap_response(
-            state,
-            headers,
-            &bytes,
-            upstream_path,
-            &credential,
-            started,
-            response,
-        ));
+        if round + 1 < retry_rounds
+            && let Some(wait) = state.routing.cooldown_wait(&values, model)
+        {
+            let wait = if max_interval == 0 {
+                std::time::Duration::ZERO
+            } else {
+                wait.min(std::time::Duration::from_secs(max_interval))
+            };
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+        }
     }
     record_failure(
         state,
@@ -776,6 +834,92 @@ mod tests {
     use bytes::Bytes;
 
     use super::{rewrite_model, should_fallback};
+
+    #[tokio::test]
+    async fn codex_routes_exclude_claude_credentials() {
+        use crate::{AppState, config::Config};
+        use axum::{
+            Router,
+            extract::State,
+            http::{HeaderMap, Method},
+            response::IntoResponse,
+            routing::post,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            auth_dir: directory.path().to_owned(),
+            request_retry: 0,
+            max_retry_credentials: 1,
+            ..Config::default()
+        };
+        config.routing.strategy = "fill-first".into();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.upstream_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/responses",
+                    post(|headers: HeaderMap| async move {
+                        assert_eq!(headers.get("authorization").unwrap(), "Bearer codex-token");
+                        "ok"
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let state = AppState::new(config).await.unwrap();
+        for provider in ["claude", "anthropic"] {
+            state
+                .auth
+                .upload(
+                    &format!("a-{provider}.json"),
+                    format!(r#"{{"type":"{provider}","access_token":"claude-token"}}"#).as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        let listed = super::models(State(state.clone())).await.into_response();
+        let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["data"], serde_json::json!([]));
+        let response = super::execute_codex(
+            &state,
+            &Method::POST,
+            &HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test"}"#),
+            "responses",
+        )
+        .await;
+        assert_eq!(
+            response.err().unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        state
+            .auth
+            .upload(
+                "z-codex.json",
+                br#"{"type":"codex","access_token":"codex-token"}"#,
+            )
+            .await
+            .unwrap();
+        let response = super::execute_codex(
+            &state,
+            &Method::POST,
+            &HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test"}"#),
+            "responses",
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        server.abort();
+    }
 
     #[test]
     fn rewrite_model_replaces_top_level_model() {
