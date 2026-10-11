@@ -57,10 +57,14 @@ pub struct ClaudeKey {
 
 /// Where a request for a provider-served model goes.
 pub struct Target {
-    url: String,
-    keys: Vec<String>,
-    model: String,
+    attempts: Vec<Attempt>,
     anthropic: bool,
+}
+
+struct Attempt {
+    url: String,
+    key: String,
+    model: String,
 }
 
 fn upstream_name(models: &[ModelAlias], requested: &str) -> Option<String> {
@@ -73,16 +77,19 @@ fn upstream_name(models: &[ModelAlias], requested: &str) -> Option<String> {
 /// The OpenAI-compatible provider that serves `model` on chat/completions.
 pub fn openai_target(config: &Config, model: &str) -> Option<Target> {
     config.openai_compatibility.iter().find_map(|provider| {
+        let upstream = upstream_name(&provider.models, model.trim())?;
         Some(Target {
-            model: upstream_name(&provider.models, model.trim())?,
-            url: format!(
-                "{}/chat/completions",
-                provider.base_url.trim().trim_end_matches('/')
-            ),
-            keys: provider
+            attempts: provider
                 .api_key_entries
                 .iter()
-                .map(|entry| entry.api_key.clone())
+                .map(|entry| Attempt {
+                    url: format!(
+                        "{}/chat/completions",
+                        provider.base_url.trim().trim_end_matches('/')
+                    ),
+                    key: entry.api_key.clone(),
+                    model: upstream.clone(),
+                })
                 .collect(),
             anthropic: false,
         })
@@ -92,26 +99,21 @@ pub fn openai_target(config: &Config, model: &str) -> Option<Target> {
 /// The Anthropic keys that serve `model` on /v1/messages. Entries listing the
 /// same model share the work: later keys are tried when earlier ones fail.
 pub fn claude_target(config: &Config, model: &str) -> Option<Target> {
-    let mut target: Option<Target> = None;
-    for entry in &config.claude_api_key {
-        let Some(upstream) = upstream_name(&entry.models, model.trim()) else {
-            continue;
-        };
-        let base = entry.base_url.trim().trim_end_matches('/');
-        let base = if base.is_empty() { ANTHROPIC_URL } else { base };
-        match &mut target {
-            Some(target) => target.keys.push(entry.api_key.clone()),
-            None => {
-                target = Some(Target {
-                    url: format!("{base}/v1/messages"),
-                    keys: vec![entry.api_key.clone()],
-                    model: upstream,
-                    anthropic: true,
-                })
-            }
-        }
-    }
-    target
+    let attempts = config
+        .claude_api_key
+        .iter()
+        .filter_map(|entry| {
+            let model = upstream_name(&entry.models, model.trim())?;
+            let base = entry.base_url.trim().trim_end_matches('/');
+            let base = if base.is_empty() { ANTHROPIC_URL } else { base };
+            Some(Attempt {
+                url: format!("{base}/v1/messages"),
+                key: entry.api_key.clone(),
+                model,
+            })
+        })
+        .collect::<Vec<_>>();
+    (!attempts.is_empty()).then_some(Target { attempts, anthropic: true })
 }
 
 /// Forward a request as-is (with the upstream model name) and stream the
@@ -122,19 +124,19 @@ pub async fn execute(
     headers: &HeaderMap,
     mut payload: Value,
 ) -> Result<proxy::UpstreamResponse, AppError> {
-    payload["model"] = Value::String(target.model);
-    let body = Bytes::from(
-        serde_json::to_vec(&payload).map_err(|_| AppError::bad_request("invalid request"))?,
-    );
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE;
-    for key in &target.keys {
+    for attempt in &target.attempts {
+        payload["model"] = Value::String(attempt.model.clone());
+        let body = Bytes::from(
+            serde_json::to_vec(&payload).map_err(|_| AppError::bad_request("invalid request"))?,
+        );
         let mut request = state
             .client
-            .post(&target.url)
+            .post(&attempt.url)
             .header("content-type", "application/json")
             .body(body.clone());
         request = if target.anthropic {
-            let mut request = request.header("x-api-key", key).header(
+            let mut request = request.header("x-api-key", &attempt.key).header(
                 "anthropic-version",
                 headers
                     .get("anthropic-version")
@@ -146,19 +148,19 @@ pub async fn execute(
             }
             request
         } else {
-            request.bearer_auth(key)
+            request.bearer_auth(&attempt.key)
         };
         let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                tracing::warn!(url = %target.url, %error, "provider request failed");
+                tracing::warn!(url = %attempt.url, %error, "provider request failed");
                 last_status = StatusCode::BAD_GATEWAY;
                 continue;
             }
         };
         last_status = response.status();
         if proxy::should_retry(last_status) {
-            tracing::warn!(url = %target.url, status = %last_status, "provider key failed");
+            tracing::warn!(url = %attempt.url, status = %last_status, "provider key failed");
             continue;
         }
         state.usage.observe(!last_status.is_success(), 0);
@@ -237,7 +239,7 @@ fn glob(pattern: &str, text: &str) -> bool {
 mod tests {
     use bytes::Bytes;
 
-    use super::{ModelAlias, OpenAiCompat, apply_codex_rules, claude_target, glob, openai_target};
+    use super::{ApiKeyEntry, ClaudeKey, ModelAlias, OpenAiCompat, apply_codex_rules, claude_target, glob, openai_target};
     use crate::config::Config;
 
     #[test]
@@ -276,16 +278,38 @@ mod tests {
         config.openai_compatibility.push(OpenAiCompat {
             name: "openrouter".into(),
             base_url: "https://openrouter.ai/api/v1/".into(),
-            api_key_entries: Vec::new(),
+            api_key_entries: vec![ApiKeyEntry { api_key: "test".into() }],
             models: vec![ModelAlias {
                 name: "moonshotai/kimi-k2".into(),
                 alias: "kimi".into(),
             }],
         });
         let target = openai_target(&config, "kimi").unwrap();
-        assert_eq!(target.url, "https://openrouter.ai/api/v1/chat/completions");
-        assert_eq!(target.model, "moonshotai/kimi-k2");
+        assert_eq!(target.attempts[0].url, "https://openrouter.ai/api/v1/chat/completions");
+        assert_eq!(target.attempts[0].model, "moonshotai/kimi-k2");
         assert!(openai_target(&config, "moonshotai/kimi-k2").is_none());
         assert!(claude_target(&config, "kimi").is_none());
+    }
+
+    #[test]
+    fn claude_failover_preserves_each_entry_url_and_model() {
+        let mut config = Config::default();
+        config.claude_api_key = vec![
+            ClaudeKey {
+                api_key: "first".into(),
+                base_url: "https://first.example".into(),
+                models: vec![ModelAlias { name: "upstream-one".into(), alias: "shared".into() }],
+            },
+            ClaudeKey {
+                api_key: "second".into(),
+                base_url: "https://second.example".into(),
+                models: vec![ModelAlias { name: "upstream-two".into(), alias: "shared".into() }],
+            },
+        ];
+        let target = claude_target(&config, "shared").unwrap();
+        assert_eq!(target.attempts[0].url, "https://first.example/v1/messages");
+        assert_eq!(target.attempts[0].model, "upstream-one");
+        assert_eq!(target.attempts[1].url, "https://second.example/v1/messages");
+        assert_eq!(target.attempts[1].model, "upstream-two");
     }
 }
