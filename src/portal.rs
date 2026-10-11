@@ -32,6 +32,8 @@ pub async fn asset(axum::extract::Path(path): axum::extract::Path<String>) -> Re
     };
     Response::builder()
         .header(header::CONTENT_TYPE, content_type)
+        // The file names never change, so a new build must not be served from cache.
+        .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(bytes))
         .unwrap()
 }

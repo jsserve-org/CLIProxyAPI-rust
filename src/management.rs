@@ -6,7 +6,7 @@ use std::{
 use axum::{
     Json,
     body::Bytes,
-    extract::{Multipart, Query, Request, State},
+    extract::{Multipart, Path, Query, Request, State},
     http::{HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -14,7 +14,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::{AppState, auth::public_entry, copilot, error::AppError, oauth::Provider};
+use crate::{
+    AppState, auth::public_entry, codex_oauth, config::Config, copilot, error::AppError, kimi, logs,
+};
 
 pub async fn config(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config();
@@ -157,167 +159,6 @@ pub async fn patch_status(
 pub async fn refresh(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     state.auth.reload().await?;
     Ok(Json(json!({"status":"ok"})))
-}
-
-pub async fn codex_auth_url(state: State<AppState>) -> Result<impl IntoResponse, AppError> {
-    crate::oauth::auth_url(state, Provider::Codex, false).await
-}
-
-pub async fn anthropic_auth_url(state: State<AppState>) -> Result<impl IntoResponse, AppError> {
-    crate::oauth::auth_url(state, Provider::Anthropic, true).await
-}
-
-#[derive(Deserialize)]
-pub struct OAuthStatusQuery {
-    state: Option<String>,
-}
-
-pub async fn get_auth_status(
-    State(state): State<AppState>,
-    Query(query): Query<OAuthStatusQuery>,
-) -> impl IntoResponse {
-    if let Some(state_id) = query.state.as_deref()
-        && !crate::oauth::validate_state(state_id)
-    {
-        return Json(json!({"status":"error", "error":"invalid state"}));
-    }
-    Json(state.oauth.status(query.state.as_deref()).await)
-}
-
-pub async fn delete_oauth_session(
-    State(state): State<AppState>,
-    Query(query): Query<OAuthStatusQuery>,
-) -> impl IntoResponse {
-    let Some(state_id) = query.state.as_deref().filter(|value| !value.is_empty()) else {
-        return Json(json!({"status":"error", "error":"missing state"}));
-    };
-    if !crate::oauth::validate_state(state_id) {
-        return Json(json!({"status":"error", "error":"invalid state"}));
-    }
-    Json(json!({"status":"ok", "cancelled":state.oauth.cancel(Some(state_id)).await}))
-}
-
-#[derive(Deserialize)]
-pub struct OAuthCallbackQuery {
-    provider: Option<String>,
-    redirect_url: Option<String>,
-    state: Option<String>,
-    code: Option<String>,
-    error: Option<String>,
-    error_description: Option<String>,
-}
-
-pub async fn oauth_callback_get(
-    State(state): State<AppState>,
-    Query(query): Query<OAuthCallbackQuery>,
-) -> Result<impl IntoResponse, AppError> {
-    let redirect = query
-        .redirect_url
-        .as_deref()
-        .map(parse_redirect_callback)
-        .transpose()?
-        .unwrap_or_default();
-    if let Some(error) = query.error.or(redirect.error) {
-        return Err(AppError::bad_request(
-            query.error_description.unwrap_or(error),
-        ));
-    }
-    let state_id = query
-        .state
-        .or(redirect.state)
-        .ok_or_else(|| AppError::bad_request("state is required"))?;
-    if !crate::oauth::validate_state(&state_id) {
-        return Err(AppError::bad_request("invalid state"));
-    }
-    let code = query
-        .code
-        .or(redirect.code)
-        .ok_or_else(|| AppError::bad_request("code is required"))?;
-    let provider = state
-        .oauth
-        .provider(&state_id)
-        .await
-        .ok_or_else(|| AppError::bad_request("unknown OAuth state"))?;
-    if let Some(requested) = query.provider.as_deref()
-        && !requested.eq_ignore_ascii_case(crate::oauth::provider_name(provider))
-        && !(provider == Provider::Anthropic && requested.eq_ignore_ascii_case("claude"))
-    {
-        return Err(AppError::bad_request("provider does not match state"));
-    }
-    Ok(Json(
-        crate::oauth::callback(&state, provider, state_id, code).await?,
-    ))
-}
-
-#[derive(Deserialize)]
-pub struct OAuthCallbackBody {
-    redirect_url: Option<String>,
-    state: Option<String>,
-    code: Option<String>,
-    provider: Option<String>,
-    error: Option<String>,
-    error_description: Option<String>,
-}
-
-pub async fn oauth_callback_post(
-    State(state): State<AppState>,
-    Json(body): Json<OAuthCallbackBody>,
-) -> Result<impl IntoResponse, AppError> {
-    let redirect = body
-        .redirect_url
-        .as_deref()
-        .map(parse_redirect_callback)
-        .transpose()?
-        .unwrap_or_default();
-    if let Some(error) = body.error.or(redirect.error) {
-        return Err(AppError::bad_request(
-            body.error_description.unwrap_or(error),
-        ));
-    }
-    let state_id = body
-        .state
-        .or(redirect.state)
-        .ok_or_else(|| AppError::bad_request("state is required"))?;
-    if !crate::oauth::validate_state(&state_id) {
-        return Err(AppError::bad_request("invalid state"));
-    }
-    let code = body
-        .code
-        .or(redirect.code)
-        .ok_or_else(|| AppError::bad_request("code is required"))?;
-    let provider = match body.provider.as_deref() {
-        Some("anthropic") | Some("claude") => Provider::Anthropic,
-        Some("codex") => Provider::Codex,
-        None => state
-            .oauth
-            .provider(&state_id)
-            .await
-            .ok_or_else(|| AppError::bad_request("unknown OAuth state"))?,
-        Some(_) => return Err(AppError::bad_request("unsupported provider")),
-    };
-    Ok(Json(
-        crate::oauth::callback(&state, provider, state_id, code).await?,
-    ))
-}
-
-#[derive(Default)]
-struct RedirectCallback {
-    state: Option<String>,
-    code: Option<String>,
-    error: Option<String>,
-}
-
-fn parse_redirect_callback(value: &str) -> Result<RedirectCallback, AppError> {
-    let url = Url::parse(value).map_err(|_| AppError::bad_request("invalid redirect_url"))?;
-    let query = url.query_pairs().collect::<HashMap<_, _>>();
-    Ok(RedirectCallback {
-        state: query.get("state").map(ToString::to_string),
-        code: query.get("code").map(ToString::to_string),
-        error: query
-            .get("error")
-            .or_else(|| query.get("error_description"))
-            .map(ToString::to_string),
-    })
 }
 
 #[derive(Deserialize)]
@@ -921,6 +762,341 @@ pub async fn copilot_delete(
         return Err(AppError::not_found("Copilot credential not found"));
     }
     Ok(Json(json!({"status":"ok"})))
+}
+
+/// Upstream-shaped `{"error": code, "message": detail}` body for config writes.
+fn config_error(status: StatusCode, code: &str, message: impl ToString) -> Response {
+    (
+        status,
+        Json(json!({"error": code, "message": message.to_string()})),
+    )
+        .into_response()
+}
+
+pub async fn get_config_yaml(State(state): State<AppState>) -> Response {
+    let Some(path) = &state.config_path else {
+        return config_error(StatusCode::NOT_FOUND, "not_found", "config file not found");
+    };
+    match tokio::fs::read(path).await {
+        Ok(data) => (
+            [
+                ("content-type", "application/yaml; charset=utf-8"),
+                ("cache-control", "no-store"),
+            ],
+            data,
+        )
+            .into_response(),
+        Err(error) => config_error(StatusCode::INTERNAL_SERVER_ERROR, "read_failed", error),
+    }
+}
+
+/// Validate, write and apply a new config file. Listener addresses, the auth
+/// directory and the HTTP client are fixed at startup and need a restart.
+pub async fn put_config_yaml(State(state): State<AppState>, body: Bytes) -> Response {
+    let Some(path) = &state.config_path else {
+        return config_error(StatusCode::NOT_FOUND, "not_found", "config file not found");
+    };
+    if let Err(error) = serde_yaml::from_slice::<serde_yaml::Value>(&body) {
+        return config_error(StatusCode::BAD_REQUEST, "invalid_yaml", error);
+    }
+    let config = match Config::parse(&body) {
+        Ok(config) => config,
+        Err(error) => {
+            return config_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_config",
+                format!("{error:#}"),
+            );
+        }
+    };
+    if let Err(error) = crate::auth::write_private_bytes(path, &body).await {
+        return config_error(StatusCode::INTERNAL_SERVER_ERROR, "write_failed", error);
+    }
+    state
+        .usage
+        .set_usage_statistics_enabled(config.usage_statistics_enabled);
+    *state.config.write().unwrap() = config;
+    tracing::info!("config.yaml replaced through the management API");
+    Json(json!({"ok": true, "changed": ["config"]})).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct LogsQuery {
+    after: Option<i64>,
+    limit: Option<usize>,
+}
+
+pub async fn get_logs(Query(query): Query<LogsQuery>) -> impl IntoResponse {
+    let (mut lines, latest) = logs::since(query.after.unwrap_or(0));
+    if let Some(limit) = query.limit.filter(|limit| *limit < lines.len()) {
+        lines.drain(..lines.len() - limit);
+    }
+    Json(json!({"lines": lines, "line-count": lines.len(), "latest-timestamp": latest}))
+}
+
+pub async fn delete_logs() -> impl IntoResponse {
+    logs::clear();
+    Json(json!({"success": true, "message": "Logs cleared successfully"}))
+}
+
+pub async fn codex_auth_url(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    let (url, oauth_state) = state.codex_oauth.start()?;
+    Ok(Json(
+        json!({"status": "ok", "url": url, "state": oauth_state}),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct OAuthCallback {
+    #[serde(default)]
+    redirect_url: String,
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    error: String,
+}
+
+/// Finish a Codex sign-in from the pasted redirect URL (or its code + state).
+pub async fn oauth_callback(
+    State(state): State<AppState>,
+    Json(mut body): Json<OAuthCallback>,
+) -> Result<impl IntoResponse, AppError> {
+    if !body.redirect_url.trim().is_empty() {
+        let url = Url::parse(body.redirect_url.trim())
+            .map_err(|_| AppError::bad_request("invalid redirect_url"))?;
+        for (name, value) in url.query_pairs() {
+            let target = match name.as_ref() {
+                "code" => &mut body.code,
+                "state" => &mut body.state,
+                "error" | "error_description" => &mut body.error,
+                _ => continue,
+            };
+            if target.is_empty() {
+                *target = value.into_owned();
+            }
+        }
+    }
+    let oauth_state = body.state.trim();
+    if oauth_state.is_empty() {
+        return Err(AppError::bad_request("state is required"));
+    }
+    if !body.error.trim().is_empty() {
+        state.codex_oauth.fail(oauth_state, body.error.trim());
+        return Err(AppError::bad_request(body.error.trim()));
+    }
+    if body.code.trim().is_empty() {
+        return Err(AppError::bad_request("code or error is required"));
+    }
+    let name = state
+        .codex_oauth
+        .complete(&state.client, &state.auth, oauth_state, body.code.trim())
+        .await?;
+    Ok(Json(json!({"status": "ok", "name": name})))
+}
+
+#[derive(Deserialize)]
+pub struct AuthStatusQuery {
+    #[serde(default)]
+    state: String,
+}
+
+pub async fn get_auth_status(
+    State(state): State<AppState>,
+    Query(query): Query<AuthStatusQuery>,
+) -> impl IntoResponse {
+    let login = query.state.trim();
+    if state.kimi.knows_login(login) {
+        return Json(match state.kimi.login_status(login) {
+            Some(Some(error)) => json!({"status": "error", "error": error}),
+            Some(None) => json!({"status": "ok"}),
+            None => json!({"status": "wait"}),
+        });
+    }
+    Json(match state.codex_oauth.status(login) {
+        codex_oauth::Status::Done => json!({"status": "ok"}),
+        codex_oauth::Status::Waiting => json!({"status": "wait"}),
+        codex_oauth::Status::Failed(error) => json!({"status": "error", "error": error}),
+    })
+}
+
+pub async fn get_usage(State(state): State<AppState>) -> impl IntoResponse {
+    let minutes = state.usage.minutes();
+    let total: i64 = minutes.iter().map(|minute| minute.requests).sum();
+    let failed: i64 = minutes.iter().map(|minute| minute.failed).sum();
+    let tokens: i64 = minutes.iter().map(|minute| minute.tokens).sum();
+    Json(json!({"usage": {
+        "total_requests": total,
+        "success_count": total - failed,
+        "failure_count": failed,
+        "total_tokens": tokens,
+        "minutes": minutes,
+    }}))
+}
+
+pub async fn request_error_logs(State(state): State<AppState>) -> impl IntoResponse {
+    let files: Vec<Value> = state
+        .usage
+        .error_logs()
+        .iter()
+        .map(|log| json!({"name": log.name, "size": log.content.len(), "modified": log.modified}))
+        .collect();
+    Json(json!({"files": files}))
+}
+
+pub async fn request_error_log(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Response, AppError> {
+    let log = state
+        .usage
+        .error_logs()
+        .into_iter()
+        .find(|log| log.name == name)
+        .ok_or_else(|| AppError::not_found("error log not found"))?;
+    Ok((
+        [
+            ("content-type", "application/json"),
+            ("content-disposition", "attachment"),
+        ],
+        log.content,
+    )
+        .into_response())
+}
+
+/// A list/map body, bare or wrapped as `{"items": ...}` like upstream accepts.
+fn parse_items<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, AppError> {
+    #[derive(Deserialize)]
+    struct Wrapper<T> {
+        items: T,
+    }
+    serde_json::from_slice::<T>(body)
+        .or_else(|_| serde_json::from_slice::<Wrapper<T>>(body).map(|wrapper| wrapper.items))
+        .map_err(|_| AppError::bad_request("invalid body"))
+}
+
+fn require_http_url(value: &str) -> Result<(), AppError> {
+    match Url::parse(value.trim()) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(()),
+        _ => Err(AppError::bad_request("base-url must be an http(s) URL")),
+    }
+}
+
+pub async fn get_openai_compatibility(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({"openai-compatibility": state.config().openai_compatibility}))
+}
+
+pub async fn put_openai_compatibility(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let providers: Vec<crate::providers::OpenAiCompat> = parse_items(&body)?;
+    for provider in &providers {
+        if provider.name.trim().is_empty() {
+            return Err(AppError::bad_request("provider name is required"));
+        }
+        require_http_url(&provider.base_url)?;
+    }
+    state.config.write().unwrap().openai_compatibility = providers;
+    Ok(Json(json!({"status":"ok"})))
+}
+
+pub async fn get_claude_api_key(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({"claude-api-key": state.config().claude_api_key}))
+}
+
+pub async fn put_claude_api_key(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    let keys: Vec<crate::providers::ClaudeKey> = parse_items(&body)?;
+    for key in &keys {
+        if key.api_key.trim().is_empty() {
+            return Err(AppError::bad_request("api-key is required"));
+        }
+        if !key.base_url.trim().is_empty() {
+            require_http_url(&key.base_url)?;
+        }
+    }
+    state.config.write().unwrap().claude_api_key = keys;
+    Ok(Json(json!({"status":"ok"})))
+}
+
+pub async fn get_oauth_model_alias(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({"oauth-model-alias": state.config().oauth_model_alias}))
+}
+
+pub async fn put_oauth_model_alias(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    state.config.write().unwrap().oauth_model_alias = parse_items(&body)?;
+    Ok(Json(json!({"status":"ok"})))
+}
+
+pub async fn get_oauth_excluded_models(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({"oauth-excluded-models": state.config().oauth_excluded_models}))
+}
+
+pub async fn put_oauth_excluded_models(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    state.config.write().unwrap().oauth_excluded_models = parse_items(&body)?;
+    Ok(Json(json!({"status":"ok"})))
+}
+
+/// Start a Kimi device-code sign-in; poll `/get-auth-status` with the state.
+pub async fn kimi_auth_url(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    let (device, login) = kimi::start_login(&state).await?;
+    let url = if device.verification_uri_complete.is_empty() {
+        device.verification_uri
+    } else {
+        device.verification_uri_complete
+    };
+    Ok(Json(json!({
+        "status": "ok",
+        "url": url,
+        "state": login,
+        "user_code": device.user_code,
+    })))
+}
+
+pub async fn kimi_status(State(state): State<AppState>) -> impl IntoResponse {
+    let files: Vec<Value> = state
+        .kimi
+        .list()
+        .await
+        .iter()
+        .map(|credential| kimi::public_entry(credential))
+        .collect();
+    Json(json!({"files": files}))
+}
+
+pub async fn kimi_delete(
+    State(state): State<AppState>,
+    Query(query): Query<CopilotQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let auth_index = query
+        .auth_index
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("auth_index is required"))?;
+    if !state.kimi.delete(auth_index).await? {
+        return Err(AppError::not_found("Kimi credential not found"));
+    }
+    Ok(Json(json!({"status":"ok"})))
+}
+
+/// Tell management clients which build they are talking to.
+pub async fn version_header(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        "x-cpa-version",
+        HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+    );
+    response
 }
 
 pub async fn not_implemented(request: Request) -> AppError {

@@ -4,6 +4,7 @@ COPY Cargo.toml Cargo.lock* ./
 COPY .docker/cache-src ./src
 RUN cargo build --locked --release
 COPY src ./src
+COPY web/dist ./web/dist
 RUN find src -type f -exec touch {} +
 RUN cargo build --locked --release
 

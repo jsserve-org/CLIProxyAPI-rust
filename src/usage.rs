@@ -16,6 +16,27 @@ pub const ACCOUNTING_VERSION: i64 = 1;
 pub const DEFAULT_RETENTION_SECONDS: i64 = 60;
 pub const MAX_RETENTION_SECONDS: i64 = 3600;
 
+const STATS_MINUTES: usize = 60;
+const MAX_ERROR_LOGS: usize = 100;
+
+/// Requests handled during one wall-clock minute.
+#[derive(Clone, Debug, Serialize)]
+pub struct Minute {
+    /// Unix seconds at the start of the minute.
+    pub time: i64,
+    pub requests: i64,
+    pub failed: i64,
+    pub tokens: i64,
+}
+
+/// The usage record of one failed request, kept for `/request-error-logs`.
+#[derive(Clone, Debug)]
+pub struct ErrorLog {
+    pub name: String,
+    pub modified: i64,
+    pub content: String,
+}
+
 struct QueueItem {
     enqueued_at: SystemTime,
     payload: Value,
@@ -28,6 +49,8 @@ pub struct UsageQueue {
     enabled: AtomicBool,
     stats_enabled: AtomicBool,
     retention_seconds: AtomicI64,
+    minutes: Mutex<VecDeque<Minute>>,
+    errors: Mutex<VecDeque<ErrorLog>>,
 }
 
 impl UsageQueue {
@@ -37,6 +60,8 @@ impl UsageQueue {
             enabled: AtomicBool::new(true),
             stats_enabled: AtomicBool::new(stats_enabled),
             retention_seconds: AtomicI64::new(DEFAULT_RETENTION_SECONDS),
+            minutes: Mutex::new(VecDeque::new()),
+            errors: Mutex::new(VecDeque::new()),
         };
         queue.set_retention_seconds(retention_seconds);
         queue
@@ -80,9 +105,74 @@ impl UsageQueue {
         self.enabled() && self.usage_statistics_enabled()
     }
 
+    /// Count one finished request towards the per-minute throughput.
+    pub fn observe(&self, failed: bool, tokens: i64) {
+        if !self.recording() {
+            return;
+        }
+        let time = unix_now() / 60 * 60;
+        let mut minutes = self.minutes.lock().unwrap();
+        if minutes.back().is_none_or(|minute| minute.time != time) {
+            if minutes.len() == STATS_MINUTES {
+                minutes.pop_front();
+            }
+            minutes.push_back(Minute {
+                time,
+                requests: 0,
+                failed: 0,
+                tokens: 0,
+            });
+        }
+        let minute = minutes.back_mut().unwrap();
+        minute.requests += 1;
+        minute.failed += failed as i64;
+        minute.tokens += tokens;
+    }
+
+    /// Throughput for the last hour, oldest minute first.
+    pub fn minutes(&self) -> Vec<Minute> {
+        self.minutes.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Failed requests, newest first.
+    pub fn error_logs(&self) -> Vec<ErrorLog> {
+        self.errors.lock().unwrap().iter().rev().cloned().collect()
+    }
+
+    fn keep_error(&self, payload: &Value) {
+        let now = unix_now();
+        let mut errors = self.errors.lock().unwrap();
+        if errors.len() == MAX_ERROR_LOGS {
+            errors.pop_front();
+        }
+        let status = payload
+            .pointer("/fail/status_code")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        // The counter keeps names unique when several requests fail in one second.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        errors.push_back(ErrorLog {
+            name: format!("error-{now}-{sequence}-{status}.log"),
+            modified: now,
+            content: serde_json::to_string_pretty(payload).unwrap_or_default(),
+        });
+    }
+
     pub fn enqueue(&self, payload: Value) {
         if !self.enabled() {
             return;
+        }
+        let failed = payload.get("failed").and_then(Value::as_bool) == Some(true);
+        self.observe(
+            failed,
+            payload
+                .pointer("/tokens/total_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+        );
+        if failed {
+            self.keep_error(&payload);
         }
         let now = SystemTime::now();
         let mut items = self.items.lock().unwrap();
@@ -111,6 +201,13 @@ impl UsageQueue {
         let take = count.min(items.len());
         items.drain(..take).map(|item| item.payload).collect()
     }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn prune(items: &mut VecDeque<QueueItem>, now: SystemTime, retention_seconds: i64) {

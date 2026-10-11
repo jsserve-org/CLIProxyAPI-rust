@@ -68,8 +68,37 @@ copilot:
   upstream-url: https://api.githubcopilot.com
   models: []
 
-# CPAMP's management api-call endpoint is an SSRF capability. Only these HTTPS
-# destinations are accepted. Add an exact provider hostname if CPAMP needs it.
+# OpenAI-compatible upstreams. A chat/completions request for one of these
+# models is forwarded with the provider's key; the next key is tried when one
+# fails. `alias` is the name clients use (defaults to `name`). Gemini works
+# through its OpenAI endpoint.
+openai-compatibility: []
+#  - name: gemini
+#    base-url: https://generativelanguage.googleapis.com/v1beta/openai
+#    api-key-entries:
+#      - api-key: replace-with-a-provider-key
+#    models:
+#      - name: gemini-3-pro
+#        alias: gemini
+
+# Anthropic API keys. A /v1/messages request for one of these models goes to
+# Anthropic (or `base-url`) untranslated.
+claude-api-key: []
+#  - api-key: replace-with-an-anthropic-key
+#    models:
+#      - name: claude-opus-5-5
+
+# Extra client-facing names for Codex models, and Codex models to hide
+# (`*` is a wildcard). Only the `codex` entry is applied.
+oauth-model-alias: {}
+#  codex:
+#    - name: gpt-5.6-sol
+#      alias: best
+oauth-excluded-models: {}
+#  codex: ["*-spark"]
+
+# The management api-call endpoint is an SSRF capability. Only these HTTPS
+# destinations are accepted. Add an exact provider hostname if you need it.
 management-allowed-hosts:
   - chatgpt.com
   - api.openai.com

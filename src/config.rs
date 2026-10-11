@@ -87,6 +87,13 @@ pub struct Config {
     pub quota_exceeded: QuotaExceeded,
     pub model_fallback: ModelFallback,
     pub copilot: CopilotConfig,
+    pub kimi: KimiConfig,
+    pub openai_compatibility: Vec<crate::providers::OpenAiCompat>,
+    pub claude_api_key: Vec<crate::providers::ClaudeKey>,
+    /// Per-provider client-facing model names; only `codex` is applied.
+    pub oauth_model_alias: std::collections::HashMap<String, Vec<crate::providers::ModelAlias>>,
+    /// Per-provider model patterns (`*` wildcard) to hide; only `codex` is applied.
+    pub oauth_excluded_models: std::collections::HashMap<String, Vec<String>>,
 }
 
 fn default_copilot_client_id() -> String {
@@ -119,6 +126,23 @@ impl Default for CopilotConfig {
             scope: default_copilot_scope(),
             upstream_url: default_copilot_upstream(),
             models: Vec::new(),
+        }
+    }
+}
+
+/// Kimi Code endpoints. Signed-in Kimi accounts serve the `kimi-*` models.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct KimiConfig {
+    pub upstream_url: String,
+    pub auth_url: String,
+}
+
+impl Default for KimiConfig {
+    fn default() -> Self {
+        Self {
+            upstream_url: "https://api.kimi.com/coding".into(),
+            auth_url: "https://auth.kimi.com".into(),
         }
     }
 }
@@ -187,6 +211,11 @@ impl Default for Config {
             quota_exceeded: QuotaExceeded::default(),
             model_fallback: ModelFallback::default(),
             copilot: CopilotConfig::default(),
+            kimi: KimiConfig::default(),
+            openai_compatibility: Vec::new(),
+            claude_api_key: Vec::new(),
+            oauth_model_alias: Default::default(),
+            oauth_excluded_models: Default::default(),
         }
     }
 }
@@ -231,8 +260,12 @@ impl Config {
         let raw = tokio::fs::read(path)
             .await
             .with_context(|| format!("read config {}", path.display()))?;
-        let mut config: Self = serde_yaml::from_slice(&raw)
-            .with_context(|| format!("parse config {}", path.display()))?;
+        Self::parse(&raw).with_context(|| format!("load config {}", path.display()))
+    }
+
+    /// Parse and validate YAML config text.
+    pub fn parse(raw: &[u8]) -> Result<Self> {
+        let mut config: Self = serde_yaml::from_slice(raw).context("parse config")?;
         config.auth_dir = expand_home(&config.auth_dir)?;
         config.validate()?;
         Ok(config)

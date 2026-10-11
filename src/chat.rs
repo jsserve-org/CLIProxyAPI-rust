@@ -63,6 +63,14 @@ async fn serve(state: AppState, request: Request, legacy: bool) -> Result<Respon
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    let provider = crate::providers::openai_target(&state.config(), &model);
+    if let (false, Some(target)) = (legacy, provider) {
+        let upstream = crate::providers::execute(&state, target, &parts.headers, payload).await?;
+        return proxy::to_axum(upstream);
+    }
+    if !legacy && crate::kimi::serves(&state, &model).await {
+        return proxy::to_axum(crate::kimi::execute(&state, payload).await?);
+    }
     if !legacy && state.provider_for(&model) == crate::Provider::Copilot {
         let body = Bytes::from(
             serde_json::to_vec(&payload).map_err(|_| AppError::bad_request("invalid request"))?,
