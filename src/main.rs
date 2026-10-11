@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cliproxyapi_rs::{AppState, admin_router, api_router, config::Config};
 use tokio::{net::TcpListener, sync::watch};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Parser)]
 #[command(name = "cliproxyapi-rs", version, about)]
@@ -15,18 +15,26 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    tracing_subscriber::registry()
+        .with(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("cliproxyapi_rs=info")),
         )
-        .compact()
+        .with(tracing_subscriber::fmt::layer().compact())
+        // Second copy without colours, kept in memory for `/v0/management/logs`.
+        .with(
+            tracing_subscriber::fmt::layer()
+                .compact()
+                .with_ansi(false)
+                .with_writer(cliproxyapi_rs::logs::BufferWriter),
+        )
         .init();
     let cli = Cli::parse();
     let config = Config::load(&cli.config).await?;
     let public_addr = config.public_addr();
     let admin_addr = config.admin_addr();
-    let state = AppState::new(config).await?;
+    let mut state = AppState::new(config).await?;
+    state.config_path = Some(cli.config.clone());
     let public_listener = TcpListener::bind(public_addr)
         .await
         .with_context(|| format!("bind public listener {public_addr}"))?;

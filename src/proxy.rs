@@ -44,14 +44,46 @@ pub async fn models(State(state): State<AppState>) -> impl IntoResponse {
         })
         .count()
         > 0;
-    let mut data: Vec<Value> = if available {
-        crate::registry::available_models("openai")
-            .iter()
-            .map(|model| model.public_entry())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let entry = |id: &str, owner: &str| json!({"id": id, "object": "model", "created": 0, "owned_by": owner});
+    let kimi_ready = state.kimi.list().await.iter().any(|item| !item.disabled);
+    let mut data: Vec<Value> = Vec::new();
+    {
+        let config = state.config();
+        if available {
+            let excluded = config.oauth_excluded_models.get("codex");
+            data.extend(
+                crate::registry::available_models("openai")
+                    .iter()
+                    .filter(|model| !crate::providers::is_excluded(excluded, &model.id))
+                    .map(|model| model.public_entry()),
+            );
+            for alias in config.oauth_model_alias.get("codex").into_iter().flatten() {
+                if !alias.alias.trim().is_empty()
+                    && !crate::providers::is_excluded(excluded, alias.name.trim())
+                {
+                    data.push(entry(alias.alias.trim(), "openai"));
+                }
+            }
+        }
+        if kimi_ready {
+            let excluded = config.oauth_excluded_models.get("kimi");
+            for model in crate::kimi::MODELS {
+                if !crate::providers::is_excluded(excluded, model) {
+                    data.push(entry(model, "kimi"));
+                }
+            }
+        }
+        for provider in &config.openai_compatibility {
+            for model in &provider.models {
+                data.push(entry(model.client_name(), provider.name.trim()));
+            }
+        }
+        for model in config.claude_api_key.iter().flat_map(|key| &key.models) {
+            if !data.iter().any(|known| known["id"] == model.client_name()) {
+                data.push(entry(model.client_name(), "anthropic"));
+            }
+        }
+    }
 
     let (copilot_enabled, copilot_models) = {
         let config = state.config();
@@ -171,6 +203,7 @@ pub(crate) async fn execute_codex(
     bytes: Bytes,
     upstream_path: &str,
 ) -> Result<UpstreamResponse, AppError> {
+    let bytes = crate::providers::apply_codex_rules(&state.config(), bytes)?;
     let chain = model_chain(state, &bytes);
     let total = chain.len();
     let mut last_status = StatusCode::BAD_GATEWAY;
@@ -677,7 +710,7 @@ fn validate_json(bytes: &[u8]) -> Result<(), AppError> {
     Ok(())
 }
 
-fn should_retry(status: StatusCode) -> bool {
+pub(crate) fn should_retry(status: StatusCode) -> bool {
     matches!(
         status.as_u16(),
         401 | 403 | 408 | 429 | 500 | 502 | 503 | 504
@@ -792,7 +825,7 @@ async fn copilot_send(
         })
 }
 
-fn passthrough_response(response: reqwest::Response) -> UpstreamResponse {
+pub(crate) fn passthrough_response(response: reqwest::Response) -> UpstreamResponse {
     let status = response.status();
     let headers = response.headers().clone();
     UpstreamResponse {

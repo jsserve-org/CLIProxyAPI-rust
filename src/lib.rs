@@ -1,13 +1,15 @@
 pub mod auth;
 pub mod chat;
 pub mod claude;
+pub mod codex_oauth;
 pub mod config;
 pub mod copilot;
 pub mod error;
-pub mod gemini;
+pub mod kimi;
+pub mod logs;
 pub mod management;
-pub mod oauth;
 pub mod portal;
+pub mod providers;
 pub mod proxy;
 pub mod registry;
 pub mod responses_websocket;
@@ -15,7 +17,10 @@ pub mod routing;
 pub mod security;
 pub mod usage;
 
-use std::sync::{Arc, RwLock};
+use std::{
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -38,7 +43,10 @@ pub struct AppState {
     pub routing: Arc<routing::RoutingState>,
     pub usage: Arc<usage::UsageQueue>,
     pub copilot: Arc<copilot::CopilotStore>,
-    pub oauth: oauth::OAuthSessions,
+    pub codex_oauth: Arc<codex_oauth::Sessions>,
+    pub kimi: Arc<kimi::KimiStore>,
+    /// The file `/config.yaml` reads and writes; unset when there is none.
+    pub config_path: Option<PathBuf>,
 }
 
 impl AppState {
@@ -60,6 +68,7 @@ impl AppState {
             config.redis_usage_queue_retention_seconds as i64,
         ));
         let copilot = Arc::new(copilot::CopilotStore::new(config.auth_dir.clone()).await?);
+        let kimi = Arc::new(kimi::KimiStore::new(config.auth_dir.clone()).await?);
         let routing = Arc::new(routing::RoutingState::new(&config)?);
         Ok(Self {
             routing,
@@ -68,7 +77,9 @@ impl AppState {
             client,
             usage,
             copilot,
-            oauth: oauth::OAuthSessions::default(),
+            codex_oauth: Arc::default(),
+            kimi,
+            config_path: None,
         })
     }
 
@@ -120,9 +131,6 @@ fn api_routes(state: &AppState) -> Router<AppState> {
         .route("/v1/responses/compact", post(proxy::responses_compact))
         .route("/v1/messages", post(claude::messages))
         .route("/v1/messages/count_tokens", post(claude::count_tokens))
-        .route("/v1beta/models", get(gemini::models))
-        .route("/v1beta/interactions", post(gemini::interactions))
-        .route("/v1beta/models/{*action}", any(gemini::action))
         .route(
             "/backend-api/codex/responses",
             get(responses_websocket::responses_websocket),
@@ -156,17 +164,44 @@ pub fn admin_router(state: AppState) -> Router {
         .route("/auth-files/download", get(management::download))
         .route("/auth-files/status", patch(management::patch_status))
         .route("/auth-files/refresh", post(management::refresh))
-        .route("/anthropic-auth-url", get(management::anthropic_auth_url))
+        .route(
+            "/config.yaml",
+            get(management::get_config_yaml).put(management::put_config_yaml),
+        )
+        .route(
+            "/logs",
+            get(management::get_logs).delete(management::delete_logs),
+        )
+        .route("/usage", get(management::get_usage))
+        .route("/request-error-logs", get(management::request_error_logs))
+        .route(
+            "/request-error-logs/{name}",
+            get(management::request_error_log),
+        )
+        .route(
+            "/openai-compatibility",
+            get(management::get_openai_compatibility).put(management::put_openai_compatibility),
+        )
+        .route(
+            "/claude-api-key",
+            get(management::get_claude_api_key).put(management::put_claude_api_key),
+        )
+        .route(
+            "/oauth-model-alias",
+            get(management::get_oauth_model_alias).put(management::put_oauth_model_alias),
+        )
+        .route(
+            "/oauth-excluded-models",
+            get(management::get_oauth_excluded_models).put(management::put_oauth_excluded_models),
+        )
         .route("/codex-auth-url", get(management::codex_auth_url))
+        .route("/kimi-auth-url", get(management::kimi_auth_url))
+        .route(
+            "/kimi",
+            get(management::kimi_status).delete(management::kimi_delete),
+        )
+        .route("/oauth-callback", post(management::oauth_callback))
         .route("/get-auth-status", get(management::get_auth_status))
-        .route(
-            "/oauth-session",
-            axum::routing::delete(management::delete_oauth_session),
-        )
-        .route(
-            "/oauth-callback",
-            get(management::oauth_callback_get).post(management::oauth_callback_post),
-        )
         .route("/api-call", post(management::api_call))
         .route("/usage-queue", get(management::usage_queue))
         .route(
@@ -271,6 +306,7 @@ pub fn admin_router(state: AppState) -> Router {
                 .delete(management::delete_api_keys),
         )
         .fallback(management::not_implemented)
+        .layer(middleware::map_response(management::version_header))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             security::require_management_key,
@@ -319,6 +355,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn config_yaml_is_validated_written_and_applied() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let yaml = |retry: usize| {
+            format!(
+                "auth-dir: {}\napi-keys: [api-test]\nremote-management:\n  secret-key: admin-test\nrequest-retry: {retry}\n",
+                directory.path().display()
+            )
+        };
+        std::fs::write(&path, yaml(1)).unwrap();
+        let mut state = state().await;
+        state.config_path = Some(path.clone());
+        let put = |body: String| {
+            Request::put("/v0/management/config.yaml")
+                .header("x-management-key", "admin-test")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let rejected = admin_router(state.clone())
+            .oneshot(put("api-keys: []\n".into()))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml(1));
+
+        let saved = admin_router(state.clone())
+            .oneshot(put(yaml(7)))
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert_eq!(saved.headers()["x-cpa-version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml(7));
+        assert_eq!(state.config().request_retry, 7);
     }
 
     #[tokio::test]

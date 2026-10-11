@@ -12,8 +12,8 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 
-const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub(crate) const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+pub(crate) const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 #[derive(Clone, Debug)]
 pub struct Credential {
@@ -339,7 +339,7 @@ pub(crate) async fn write_private_json(path: &Path, value: &Value) -> Result<()>
     write_private_bytes(path, &serde_json::to_vec(value)?).await
 }
 
-async fn write_private_bytes(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) async fn write_private_bytes(path: &Path, data: &[u8]) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let temporary = path.with_extension("json.tmp");
     let mut options = tokio::fs::OpenOptions::new();

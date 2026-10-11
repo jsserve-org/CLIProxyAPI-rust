@@ -1,10 +1,15 @@
 # Operator Console
 
-A Vite + React management portal for the private admin listener. It uses the existing `/v0/management/*` API and sends the `x-management-key` header; the Rust API surface remains available for custom clients.
+The management UI for the private admin listener, served at `/console`. It is a
+Vite + React app built on [shadcn/ui](https://ui.shadcn.com) and covers every
+`/v0/management/*` route the Rust core implements. It only talks to that API
+(with the `x-management-key` header), so custom clients keep working unchanged.
 
 ```sh
 bun install
-bun run dev
+bun run dev    # proxies /v0/management to the admin listener on 127.0.0.1:8318
+bun run build  # writes dist/, which the Rust binary embeds at compile time
 ```
 
-Build with `bun run build` and serve `dist/` from the admin listener or your preferred static host.
+Commit `dist/` after building: `src/portal.rs` includes it with `include_str!`.
+Add components with `bunx shadcn@latest add <name>`.

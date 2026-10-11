@@ -276,6 +276,11 @@ pub async fn messages(
         .and_then(Value::as_str)
         .unwrap_or("gpt-5.6-sol")
         .to_owned();
+    let provider = crate::providers::claude_target(&state.config(), &model);
+    if let Some(target) = provider {
+        let upstream = crate::providers::execute(&state, target, &parts.headers, payload).await?;
+        return proxy::to_axum(upstream);
+    }
     let translated = translate_request(&payload)?;
     let input_tokens = tokio::task::spawn_blocking(move || count_claude_input_tokens(&payload))
         .await

@@ -75,6 +75,18 @@ Implemented:
   executor, model/alias, endpoint, auth, client metadata, latency/TTFT, failure detail,
   and token breakdown parsed from the Codex `response.completed` event), plus
   `/v0/management/usage-queue` draining and the `usage-statistics-enabled` toggle
+- Kimi Code provider: device-code sign-in (`/v0/management/kimi-auth-url`, polled with
+  `/get-auth-status`), token refresh, `type: "kimi"` auth files listed/deleted via
+  `/v0/management/kimi`, and the `kimi-*` models on chat/completions
+- API-key providers: `openai-compatibility` upstreams on chat/completions and
+  `claude-api-key` on `/v1/messages`, both passed through untranslated with key
+  failover; Codex `oauth-model-alias` and `oauth-excluded-models` rules
+- Per-minute throughput (`/v0/management/usage`) and the last 100 failed requests
+  (`/request-error-logs`), both in memory and gated by `usage-statistics-enabled`
+- Operator essentials for the built-in console: `config.yaml` read/validate/write
+  (`/v0/management/config.yaml`), an in-memory process log (`/logs`), and Codex OAuth
+  sign-in by pasting the redirect URL (`/codex-auth-url`, `/oauth-callback`,
+  `/get-auth-status`)
 - Management config routes with upstream response shapes: `debug`, `logging-to-file`,
   `logs-max-total-size-mb`, `error-logs-max-files`, `request-retry`,
   `max-retry-credentials`, `max-retry-interval`, `force-model-prefix`, `proxy-url`,
@@ -86,22 +98,16 @@ Implemented:
   `copilot.models` through `api.githubcopilot.com` (chat/completions, responses,
   and `/v1/models`)
 - Existing CLIProxyAPI Codex auth-file shape and plaintext or bcrypt management keys
-- Gemini-compatible forwarding: configure `gemini-api-key` and
-  `interactions-api-key` entries for `/v1beta/models`, Gemini model actions
-  such as `generateContent`/`streamGenerateContent`, and `/v1beta/interactions`.
 
 Not yet a one-to-one replacement. The pinned upstream revision, completion
 criteria, subsystem status, and porting order are tracked in
 [`docs/PARITY.md`](docs/PARITY.md):
 
 - The full set of Anthropic beta/content-block extensions
-- Provider OAuth login is available through `/v0/management/codex-auth-url` and
-  `/v0/management/anthropic-auth-url`, with PKCE callbacks at
-  `/v0/management/oauth-callback`; pending sessions can be inspected or cancelled
-  through `/get-auth-status` and `DELETE /oauth-session`.
-- Anthropic, realtime, image/video, plugins, and Home; Gemini provider-native
-  translation and advanced model/key routing remain pending
-- The remaining CLIProxyAPI management routes (key lists for other providers and logs)
+- OAuth login for Claude, Antigravity and xAI, and the local `:1455` callback listener
+- Native Gemini and Vertex endpoints, cross-protocol translation for API-key providers,
+  realtime, image/video, plugins, and Home
+- The remaining CLIProxyAPI management routes (key lists for other providers, logs, OAuth flows)
 - The complete upstream hierarchical/LCP session-affinity behavior
 
 Unknown management paths return `501 Not Implemented`. Public unknown paths
@@ -113,7 +119,7 @@ CLIProxyAPI deployment until the parity contract passes.
 | Listener | Default | Routes | Intended exposure |
 | --- | --- | --- | --- |
 | Public | `0.0.0.0:8317` | API + health only | Reverse proxy / internet |
-| Admin | `127.0.0.1:8318` | API + `/v0/management/*` | Loopback or private VPN |
+| Admin | `127.0.0.1:8318` | API + `/v0/management/*` + `/console` | Loopback or private VPN |
 
 The public router does not register management handlers. This is stronger than
 checking a permission flag after a request reaches the handler. The admin port
@@ -127,7 +133,8 @@ cargo build --release
 ./target/release/cliproxyapi-rs --config config.yaml
 ```
 
-Point your management application at `http://127.0.0.1:8318`; point API clients at port `8317`.
+Open the built-in operator console at `http://127.0.0.1:8318/console`, or point your own
+management application at `http://127.0.0.1:8318`; point API clients at port `8317`.
 
 Private multi-architecture images are published for `linux/amd64` and
 `linux/arm64` by GitHub Actions:
