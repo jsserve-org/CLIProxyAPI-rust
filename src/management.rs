@@ -159,12 +159,12 @@ pub async fn refresh(State(state): State<AppState>) -> Result<impl IntoResponse,
     Ok(Json(json!({"status":"ok"})))
 }
 
-pub async fn codex_auth_url(state: State<AppState>) -> impl IntoResponse {
-    crate::oauth::auth_url(state, Provider::Codex).await
+pub async fn codex_auth_url(state: State<AppState>) -> Result<impl IntoResponse, AppError> {
+    crate::oauth::auth_url(state, Provider::Codex, false).await
 }
 
-pub async fn anthropic_auth_url(state: State<AppState>) -> impl IntoResponse {
-    crate::oauth::auth_url(state, Provider::Anthropic).await
+pub async fn anthropic_auth_url(state: State<AppState>) -> Result<impl IntoResponse, AppError> {
+    crate::oauth::auth_url(state, Provider::Anthropic, true).await
 }
 
 #[derive(Deserialize)]
