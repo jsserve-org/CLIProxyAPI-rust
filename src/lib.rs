@@ -4,6 +4,7 @@ pub mod claude;
 pub mod config;
 pub mod copilot;
 pub mod error;
+pub mod gemini;
 pub mod management;
 pub mod portal;
 pub mod proxy;
@@ -116,6 +117,9 @@ fn api_routes(state: &AppState) -> Router<AppState> {
         .route("/v1/responses/compact", post(proxy::responses_compact))
         .route("/v1/messages", post(claude::messages))
         .route("/v1/messages/count_tokens", post(claude::count_tokens))
+        .route("/v1beta/models", get(gemini::models))
+        .route("/v1beta/interactions", post(gemini::interactions))
+        .route("/v1beta/models/{*action}", any(gemini::action))
         .route(
             "/backend-api/codex/responses",
             get(responses_websocket::responses_websocket),
