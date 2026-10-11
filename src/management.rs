@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::{AppState, auth::public_entry, copilot, error::AppError};
+use crate::{AppState, auth::public_entry, copilot, error::AppError, oauth::Provider};
 
 pub async fn config(State(state): State<AppState>) -> impl IntoResponse {
     let config = state.config();
@@ -157,6 +157,101 @@ pub async fn patch_status(
 pub async fn refresh(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     state.auth.reload().await?;
     Ok(Json(json!({"status":"ok"})))
+}
+
+pub async fn codex_auth_url(state: State<AppState>) -> impl IntoResponse {
+    crate::oauth::auth_url(state, Provider::Codex).await
+}
+
+pub async fn anthropic_auth_url(state: State<AppState>) -> impl IntoResponse {
+    crate::oauth::auth_url(state, Provider::Anthropic).await
+}
+
+#[derive(Deserialize)]
+pub struct OAuthStatusQuery {
+    state: Option<String>,
+}
+
+pub async fn get_auth_status(
+    State(state): State<AppState>,
+    Query(query): Query<OAuthStatusQuery>,
+) -> impl IntoResponse {
+    Json(state.oauth.status(query.state.as_deref()).await)
+}
+
+pub async fn delete_oauth_session(
+    State(state): State<AppState>,
+    Query(query): Query<OAuthStatusQuery>,
+) -> impl IntoResponse {
+    Json(
+        json!({"status": if state.oauth.cancel(query.state.as_deref()).await { "ok" } else { "not_found" }}),
+    )
+}
+
+#[derive(Deserialize)]
+pub struct OAuthCallbackQuery {
+    state: Option<String>,
+    code: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+pub async fn oauth_callback_get(
+    State(state): State<AppState>,
+    Query(query): Query<OAuthCallbackQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    if let Some(error) = query.error {
+        return Err(AppError::bad_request(
+            query.error_description.unwrap_or(error),
+        ));
+    }
+    let state_id = query
+        .state
+        .ok_or_else(|| AppError::bad_request("state is required"))?;
+    let code = query
+        .code
+        .ok_or_else(|| AppError::bad_request("code is required"))?;
+    let provider = state
+        .oauth
+        .provider(&state_id)
+        .await
+        .ok_or_else(|| AppError::bad_request("unknown OAuth state"))?;
+    Ok(Json(
+        crate::oauth::callback(&state, provider, state_id, code).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct OAuthCallbackBody {
+    state: Option<String>,
+    code: Option<String>,
+    provider: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+pub async fn oauth_callback_post(
+    State(state): State<AppState>,
+    Json(body): Json<OAuthCallbackBody>,
+) -> Result<impl IntoResponse, AppError> {
+    if let Some(error) = body.error {
+        return Err(AppError::bad_request(
+            body.error_description.unwrap_or(error),
+        ));
+    }
+    let state_id = body
+        .state
+        .ok_or_else(|| AppError::bad_request("state is required"))?;
+    let code = body
+        .code
+        .ok_or_else(|| AppError::bad_request("code is required"))?;
+    let provider = match body.provider.as_deref() {
+        Some("anthropic") | Some("claude") => Provider::Anthropic,
+        _ => Provider::Codex,
+    };
+    Ok(Json(
+        crate::oauth::callback(&state, provider, state_id, code).await?,
+    ))
 }
 
 #[derive(Deserialize)]

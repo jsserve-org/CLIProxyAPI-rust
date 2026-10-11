@@ -95,10 +95,13 @@ criteria, subsystem status, and porting order are tracked in
 [`docs/PARITY.md`](docs/PARITY.md):
 
 - The full set of Anthropic beta/content-block extensions
-- Interactive OAuth login/device authorization (existing refresh tokens are supported)
+- Provider OAuth login is available through `/v0/management/codex-auth-url` and
+  `/v0/management/anthropic-auth-url`, with PKCE callbacks at
+  `/v0/management/oauth-callback`; pending sessions can be inspected or cancelled
+  through `/get-auth-status` and `DELETE /oauth-session`.
 - Anthropic, realtime, image/video, plugins, and Home; Gemini provider-native
   translation and advanced model/key routing remain pending
-- The remaining CLIProxyAPI management routes (key lists for other providers, logs, OAuth flows)
+- The remaining CLIProxyAPI management routes (key lists for other providers and logs)
 - The complete upstream hierarchical/LCP session-affinity behavior
 
 Unknown management paths return `501 Not Implemented`. Public unknown paths
