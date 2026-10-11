@@ -15,13 +15,13 @@ pub async fn index() -> Response {
 
 pub async fn asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
     let (content_type, bytes): (&str, &[u8]) = match path.as_str() {
-        "index-CY2wQssZ.css" => (
+        "index.css" => (
             "text/css; charset=utf-8",
-            include_bytes!("../web/dist/assets/index-CY2wQssZ.css"),
+            include_bytes!("../web/dist/assets/index.css"),
         ),
-        "index-DYnVaqeY.js" => (
+        "index.js" => (
             "application/javascript; charset=utf-8",
-            include_bytes!("../web/dist/assets/index-DYnVaqeY.js"),
+            include_bytes!("../web/dist/assets/index.js"),
         ),
         _ => {
             return Response::builder()
