@@ -33,6 +33,7 @@ struct Session {
     verifier: String,
     created: u64,
     completed: bool,
+    error: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -56,7 +57,7 @@ impl OAuthSessions {
                 CLAUDE_AUTHORIZE,
                 CLAUDE_CLIENT,
                 CLAUDE_REDIRECT,
-                "org:create_api_key user:profile user:inference",
+                "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
             ),
         };
         let mut url = url::Url::parse(base).expect("constant OAuth URL");
@@ -68,6 +69,14 @@ impl OAuthSessions {
             .append_pair("state", &state)
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
+        if provider == Provider::Codex {
+            url.query_pairs_mut()
+                .append_pair("prompt", "login")
+                .append_pair("id_token_add_organizations", "true")
+                .append_pair("codex_cli_simplified_flow", "true");
+        } else {
+            url.query_pairs_mut().append_pair("code", "true");
+        }
         self.inner.lock().await.insert(
             state.clone(),
             Session {
@@ -75,6 +84,7 @@ impl OAuthSessions {
                 verifier,
                 created: now(),
                 completed: false,
+                error: None,
             },
         );
         (state, url.to_string())
@@ -88,12 +98,23 @@ impl OAuthSessions {
         if session.provider != provider {
             return Err(AppError::bad_request("OAuth provider does not match state"));
         }
-        if session.completed || now().saturating_sub(session.created) > 600 {
+        if session.completed || now().saturating_sub(session.created) > 1800 {
             sessions.remove(state);
             return Err(AppError::bad_request("OAuth session expired"));
         }
-        session.completed = true;
         Ok(session.clone())
+    }
+
+    pub async fn complete(&self, state: &str) {
+        if let Some(session) = self.inner.lock().await.get_mut(state) {
+            session.completed = true;
+        }
+    }
+
+    pub async fn fail(&self, state: &str, message: String) {
+        if let Some(session) = self.inner.lock().await.get_mut(state) {
+            session.error = Some(message);
+        }
     }
 
     pub async fn provider(&self, state: &str) -> Option<Provider> {
@@ -105,17 +126,23 @@ impl OAuthSessions {
     }
 
     pub async fn cancel(&self, state: Option<&str>) -> bool {
-        state
-            .and_then(|s| self.inner.try_lock().ok()?.remove(s))
-            .is_some()
+        let Some(state) = state else {
+            return false;
+        };
+        self.inner.lock().await.remove(state).is_some()
     }
     pub async fn status(&self, state: Option<&str>) -> Value {
         let sessions = self.inner.lock().await;
-        match state.and_then(|s| sessions.get(s)) {
-            Some(s) => {
-                json!({"status":"pending", "provider": provider_name(s.provider), "created_at":s.created})
+        let Some(state) = state else {
+            return json!({"status":"ok"});
+        };
+        match sessions.get(state) {
+            Some(s) if s.completed => json!({"status":"ok"}),
+            Some(s) if s.error.is_some() => {
+                json!({"status":"error", "error":s.error.clone().unwrap_or_default()})
             }
-            None => json!({"status":"idle"}),
+            Some(_) => json!({"status":"wait"}),
+            None => json!({"status":"error", "error":"unknown or expired state"}),
         }
     }
 }
@@ -140,14 +167,23 @@ pub async fn callback(
         return Err(AppError::bad_request("OAuth code is required"));
     }
     let session = state.oauth.take(&state_id, provider).await?;
-    let token = exchange(&state.client, provider, &state_id, &code, &session.verifier).await?;
+    let token = match exchange(&state.client, provider, &state_id, &code, &session.verifier).await {
+        Ok(token) => token,
+        Err(error) => {
+            state
+                .oauth
+                .fail(&state_id, error.message().to_owned())
+                .await;
+            return Err(error);
+        }
+    };
     let filename = format!("{}-oauth-{}.json", provider_name(provider), &state_id[..8]);
     let raw = match provider {
         Provider::Codex => {
             json!({"type":"codex", "access_token":token.access_token, "refresh_token":token.refresh_token, "id_token":token.id_token, "last_refresh":now().to_string()})
         }
         Provider::Anthropic => {
-            json!({"type":"anthropic", "access_token":token.access_token, "refresh_token":token.refresh_token, "expires_in":token.expires_in, "last_refresh":now().to_string()})
+            json!({"type":"claude", "access_token":token.access_token, "refresh_token":token.refresh_token, "expires_in":token.expires_in, "last_refresh":now().to_string()})
         }
     };
     write_private_json(&state.auth.auth_dir().join(&filename), &raw)
@@ -164,6 +200,7 @@ pub async fn callback(
             format!("reload credentials: {e}"),
         )
     })?;
+    state.oauth.complete(&state_id).await;
     Ok(json!({"status":"ok", "provider":provider_name(provider), "name":filename}))
 }
 
@@ -186,9 +223,12 @@ async fn exchange(
     verifier: &str,
 ) -> Result<TokenResponse, AppError> {
     if provider == Provider::Anthropic {
+        let mut code_parts = code.splitn(2, '#');
+        let code = code_parts.next().unwrap_or_default();
+        let callback_state = code_parts.next().unwrap_or(state);
         let response = client
             .post(CLAUDE_TOKEN)
-            .json(&json!({"grant_type":"authorization_code", "code":code, "redirect_uri":CLAUDE_REDIRECT, "client_id":CLAUDE_CLIENT, "code_verifier":verifier, "state":state}))
+            .json(&json!({"grant_type":"authorization_code", "code":code, "redirect_uri":CLAUDE_REDIRECT, "client_id":CLAUDE_CLIENT, "code_verifier":verifier, "state":callback_state}))
             .send()
             .await
             .map_err(|e| AppError::bad_gateway(format!("OAuth token exchange failed: {e}")))?;
@@ -255,11 +295,22 @@ async fn exchange(
     Ok(token)
 }
 
-fn provider_name(provider: Provider) -> &'static str {
+pub(crate) fn provider_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Codex => "codex",
         Provider::Anthropic => "anthropic",
     }
+}
+
+pub(crate) fn validate_state(state: &str) -> bool {
+    !state.is_empty()
+        && state.len() <= 128
+        && !state.contains('/')
+        && !state.contains('\\')
+        && !state.contains("..")
+        && state
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
 }
 fn now() -> u64 {
     SystemTime::now()

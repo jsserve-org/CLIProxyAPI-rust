@@ -176,6 +176,11 @@ pub async fn get_auth_status(
     State(state): State<AppState>,
     Query(query): Query<OAuthStatusQuery>,
 ) -> impl IntoResponse {
+    if let Some(state_id) = query.state.as_deref()
+        && !crate::oauth::validate_state(state_id)
+    {
+        return Json(json!({"status":"error", "error":"invalid state"}));
+    }
     Json(state.oauth.status(query.state.as_deref()).await)
 }
 
@@ -183,13 +188,19 @@ pub async fn delete_oauth_session(
     State(state): State<AppState>,
     Query(query): Query<OAuthStatusQuery>,
 ) -> impl IntoResponse {
-    Json(
-        json!({"status": if state.oauth.cancel(query.state.as_deref()).await { "ok" } else { "not_found" }}),
-    )
+    let Some(state_id) = query.state.as_deref().filter(|value| !value.is_empty()) else {
+        return Json(json!({"status":"error", "error":"missing state"}));
+    };
+    if !crate::oauth::validate_state(state_id) {
+        return Json(json!({"status":"error", "error":"invalid state"}));
+    }
+    Json(json!({"status":"ok", "cancelled":state.oauth.cancel(Some(state_id)).await}))
 }
 
 #[derive(Deserialize)]
 pub struct OAuthCallbackQuery {
+    provider: Option<String>,
+    redirect_url: Option<String>,
     state: Option<String>,
     code: Option<String>,
     error: Option<String>,
@@ -200,22 +211,39 @@ pub async fn oauth_callback_get(
     State(state): State<AppState>,
     Query(query): Query<OAuthCallbackQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    if let Some(error) = query.error {
+    let redirect = query
+        .redirect_url
+        .as_deref()
+        .map(parse_redirect_callback)
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(error) = query.error.or(redirect.error) {
         return Err(AppError::bad_request(
             query.error_description.unwrap_or(error),
         ));
     }
     let state_id = query
         .state
+        .or(redirect.state)
         .ok_or_else(|| AppError::bad_request("state is required"))?;
+    if !crate::oauth::validate_state(&state_id) {
+        return Err(AppError::bad_request("invalid state"));
+    }
     let code = query
         .code
+        .or(redirect.code)
         .ok_or_else(|| AppError::bad_request("code is required"))?;
     let provider = state
         .oauth
         .provider(&state_id)
         .await
         .ok_or_else(|| AppError::bad_request("unknown OAuth state"))?;
+    if let Some(requested) = query.provider.as_deref()
+        && !requested.eq_ignore_ascii_case(crate::oauth::provider_name(provider))
+        && !(provider == Provider::Anthropic && requested.eq_ignore_ascii_case("claude"))
+    {
+        return Err(AppError::bad_request("provider does not match state"));
+    }
     Ok(Json(
         crate::oauth::callback(&state, provider, state_id, code).await?,
     ))
@@ -223,6 +251,7 @@ pub async fn oauth_callback_get(
 
 #[derive(Deserialize)]
 pub struct OAuthCallbackBody {
+    redirect_url: Option<String>,
     state: Option<String>,
     code: Option<String>,
     provider: Option<String>,
@@ -234,24 +263,61 @@ pub async fn oauth_callback_post(
     State(state): State<AppState>,
     Json(body): Json<OAuthCallbackBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    if let Some(error) = body.error {
+    let redirect = body
+        .redirect_url
+        .as_deref()
+        .map(parse_redirect_callback)
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(error) = body.error.or(redirect.error) {
         return Err(AppError::bad_request(
             body.error_description.unwrap_or(error),
         ));
     }
     let state_id = body
         .state
+        .or(redirect.state)
         .ok_or_else(|| AppError::bad_request("state is required"))?;
+    if !crate::oauth::validate_state(&state_id) {
+        return Err(AppError::bad_request("invalid state"));
+    }
     let code = body
         .code
+        .or(redirect.code)
         .ok_or_else(|| AppError::bad_request("code is required"))?;
     let provider = match body.provider.as_deref() {
         Some("anthropic") | Some("claude") => Provider::Anthropic,
-        _ => Provider::Codex,
+        Some("codex") => Provider::Codex,
+        None => state
+            .oauth
+            .provider(&state_id)
+            .await
+            .ok_or_else(|| AppError::bad_request("unknown OAuth state"))?,
+        Some(_) => return Err(AppError::bad_request("unsupported provider")),
     };
     Ok(Json(
         crate::oauth::callback(&state, provider, state_id, code).await?,
     ))
+}
+
+#[derive(Default)]
+struct RedirectCallback {
+    state: Option<String>,
+    code: Option<String>,
+    error: Option<String>,
+}
+
+fn parse_redirect_callback(value: &str) -> Result<RedirectCallback, AppError> {
+    let url = Url::parse(value).map_err(|_| AppError::bad_request("invalid redirect_url"))?;
+    let query = url.query_pairs().collect::<HashMap<_, _>>();
+    Ok(RedirectCallback {
+        state: query.get("state").map(ToString::to_string),
+        code: query.get("code").map(ToString::to_string),
+        error: query
+            .get("error")
+            .or_else(|| query.get("error_description"))
+            .map(ToString::to_string),
+    })
 }
 
 #[derive(Deserialize)]
