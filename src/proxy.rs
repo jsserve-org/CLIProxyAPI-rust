@@ -39,7 +39,9 @@ pub async fn models(State(state): State<AppState>) -> impl IntoResponse {
         .list()
         .await
         .iter()
-        .filter(|item| !item.disabled)
+        .filter(|item| {
+            !item.disabled && item.raw.get("type").and_then(Value::as_str) == Some("codex")
+        })
         .count()
         > 0;
     let mut data: Vec<Value> = if available {
@@ -210,7 +212,14 @@ async fn execute_codex_model(
     model: &str,
 ) -> Result<UpstreamResponse, AppError> {
     let started = Instant::now();
-    let values = state.auth.list().await;
+    let values: Vec<_> = state
+        .auth
+        .list()
+        .await
+        .iter()
+        .filter(|item| item.raw.get("type").and_then(Value::as_str) == Some("codex"))
+        .cloned()
+        .collect();
     if state
         .routing
         .candidates(&values, headers, &bytes)
@@ -825,6 +834,92 @@ mod tests {
     use bytes::Bytes;
 
     use super::{rewrite_model, should_fallback};
+
+    #[tokio::test]
+    async fn codex_routes_exclude_claude_credentials() {
+        use crate::{AppState, config::Config};
+        use axum::{
+            Router,
+            extract::State,
+            http::{HeaderMap, Method},
+            response::IntoResponse,
+            routing::post,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            auth_dir: directory.path().to_owned(),
+            request_retry: 0,
+            max_retry_credentials: 1,
+            ..Config::default()
+        };
+        config.routing.strategy = "fill-first".into();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.upstream_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/responses",
+                    post(|headers: HeaderMap| async move {
+                        assert_eq!(headers.get("authorization").unwrap(), "Bearer codex-token");
+                        "ok"
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let state = AppState::new(config).await.unwrap();
+        for provider in ["claude", "anthropic"] {
+            state
+                .auth
+                .upload(
+                    &format!("a-{provider}.json"),
+                    format!(r#"{{"type":"{provider}","access_token":"claude-token"}}"#).as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        let listed = super::models(State(state.clone())).await.into_response();
+        let body = axum::body::to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["data"], serde_json::json!([]));
+        let response = super::execute_codex(
+            &state,
+            &Method::POST,
+            &HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test"}"#),
+            "responses",
+        )
+        .await;
+        assert_eq!(
+            response.err().unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        state
+            .auth
+            .upload(
+                "z-codex.json",
+                br#"{"type":"codex","access_token":"codex-token"}"#,
+            )
+            .await
+            .unwrap();
+        let response = super::execute_codex(
+            &state,
+            &Method::POST,
+            &HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"gpt-test"}"#),
+            "responses",
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        server.abort();
+    }
 
     #[test]
     fn rewrite_model_replaces_top_level_model() {
